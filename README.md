@@ -1,6 +1,6 @@
 <div align="center">
   <img src="img/logo.png" alt="M5 Prom" width="400">
-  <img src="img/darkone83.png" alt="Darkone83 Customs" width="400">
+  <img src="img/Darkone83.png" alt="Darkone83 Customs" width="400">
 </div>
 
 # M5 Prom
