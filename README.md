@@ -9,25 +9,18 @@
 
 M5 Prom is designed for console repair and recovery work. It uses a purpose-built Cardputer-to-LPC adapter to access the original Xbox's 256-byte EEPROM **while the console is powered off**, and stores backups and edited images as ordinary files on a FAT32 microSD card. No running Xbox dashboard, computer connection or network is required for EEPROM operations.
 
-> **Release status:** The current source baseline is **v0.9.4 (pre-release)**. The standalone utility and Native USB Remote have been exercised on Cardputer hardware; full release validation of EEPROM operations, storage, and recovery workflows is still in progress. The [`firmware/`](firmware/) directory may be empty until a matched compiled release is published. You can build from [`src/`](src/) in the meantime.
-
-### Latest v0.9.4 improvements
-
-- **HDD Recovery:** Press `H` from Home or Inspect, then `M` for the hard drive's ATA model and `S` for its serial. Press `P` to preview the derived ATA USER unlock password or `Enter` to save a numbered FAT32 recovery report. The original HDD-key-only export remains available.
-- **Faster native USB Remote:** Pass 1 repairs FreeRTOS scheduling and adds latency/throughput diagnostics; Pass 2 batches CRC-protected display rows and improves TinyUSB buffering. The companion includes live viewing, keyboard input, SD management, screenshots and MP4 capture.
-- **Boot splash:** The embedded 240×135 artwork now includes an initialization progress bar and status messages, without an artificial minimum splash delay.
-- **Display and storage maintenance:** LCD edge-row initialization, battery voltage reporting, SD verification diagnostics and protected EEPROM backup/write operations are retained.
-
-The firmware version remains **v0.9.4** across these maintenance updates. Remote Pass 2 is the current baseline; no experimental Pass 3 changes are required.
+> **Release status:** M5 Prom v0.9.4 is a pre-release build. The handheld application and USB desktop companion have been exercised on Cardputer hardware; final EEPROM operations and adapter validation are pending before public release. Firmware binaries may not be published until that validation is complete. The source is available in [`src/`](src/).
 
 
 ## Features
 
 - Read the Xbox EEPROM twice, compare the results and save a verified original backup before editing.
+- **Verify-only:** Compare any saved 256-byte `.BIN` against two matching EEPROM reads without writing the chip or changing the RAM working image.
 - Inspect console identity, security/checksum status and supported configuration fields.
 - Edit and repair an **in-memory working copy** without changing the physical EEPROM until Write is explicitly selected.
 - Create a new retail donor EEPROM from scratch or clone an existing image from RAM or microSD.
 - Save and load versioned **256-byte `.BIN`** files without overwriting previous backups.
+- Use the **onboard SD file manager** to browse EEPROM and TXT files, rename or copy files, delete selected items with confirmation, and read recovery reports without a computer.
 - Program a connected EEPROM with prewrite backup, explicit confirmation, progress reporting and full readback verification.
 - View SD filesystem and EEPROM-detection diagnostics, battery information and adapter pinout.
 - Configure brightness, automatic dimming, sounds and Wi-Fi; optionally manage SD files through a local web browser.
@@ -88,13 +81,16 @@ M5 Prom uses a **3 × 3 menu**. Press **`1`–`9`** to highlight a command, then
 | `Backspace` | Go back; when typing, delete the previous character. |
 | `Esc` | Cancel an active text-entry screen. |
 | `0` (home) | Open **Settings**. |
+| `F` (home) | Open the onboard **SD File Manager**. |
 | `B` (home) | Show **Battery** information. |
 | `P` (home) | Show adapter **Pinout**. |
 | `M` (home) | Toggle UI sound effects. |
 | `H` (home or Inspect) | Open HDD Recovery (HDD key and optional ATA unlock-password calculation). |
+| `V` (home or Inspect) | Browse saved EEPROM files for read-only verification against the physical chip. |
+| `V` (Load file list) | Verify the highlighted `.BIN` without loading it into the working image. |
 | `Tab` (Editor) | Change editor field group. Keys `1`–`6` select a group directly. |
 | `Tab` (Wi-Fi password) | Show or hide the typed password. |
-| `W` then `Enter` (Write confirmation) | Arm and begin the confirmed physical EEPROM write. |
+| `Y`, release, then `Enter` (Write confirmation) | Arm a physical write, then explicitly begin programming. **W** remains navigation and cannot arm. |
 
 In **Edit**, use `W`/`S` to select a field and `A`/`D` or `Enter` to change it; text fields open a dedicated editor. Edits remain in RAM until you use **Save** or **Write**. Backing out of a screen is **not** a physical EEPROM write.
 
@@ -126,15 +122,50 @@ The algorithm is **HMAC-SHA1(key = decrypted Xbox HDD key, data = model bytes fo
 
 Reports are stored at `/EEPROMs/<console-serial>/HDDKEY_####.TXT` on the mounted FAT32 filesystem, exclusively numbered and verified after saving. This operation **does not write to the Xbox EEPROM or perform any ATA command**; unlocking an attached drive requires a separate compatible utility or adapter. Keep the resulting TXT private because it contains recoverable HDD security secrets. A newly generated donor HDD key will not unlock an existing drive locked with the console's former key.
 
+### Verify-only: compare SD image with physical EEPROM
+
+Verification does **not** require loading or replacing your current working image.
+
+1. With the Xbox connected through the LPC adapter and the FAT32 card available, press **`V`** from Home or Inspect.
+2. Select an EEPROM folder under `/EEPROMs/`, then select the reference `.BIN` file.
+3. M5 Prom reads exactly 256 bytes from the selected FAT file, obtains **two matching physical reads** from EEPROM address `0x54`, and compares all 256 bytes.
+4. It shows **256/256 bytes match** on success, or the number of differing bytes and the first mismatching offset plus SD/chip byte values on failure.
+
+You can also highlight a file in **Load** and press **`V`** to verify that file without loading it; **Enter** in the normal Load browser continues to load as before. Backspace cancels browsing. No write command, new SD backup, EEPROM change or modification to the in-memory working image is performed. A matching image may still contain invalid security/checksum fields: Verify tests **byte equality**, not whether a retail image is semantically valid. Use Inspect/Repair for those checks.
+
 ### Writing an EEPROM
 
 1. Load, create or edit the intended image, then verify its details.
 2. Select **Write** (`7`, then Enter). M5 Prom reads the target, compares two physical reads, and saves verified **`PREWRITE_####.BIN`** and **`TO_WRITE_####.BIN`** files to SD.
 3. Review the target/source details and any security or revision warning.
-4. Press **`W`** to arm, then **Enter** to begin programming. **Backspace** cancels while still on the confirmation page.
+4. Press **`Y`** to arm; release it, then press **Enter** to begin programming. **W is not a write shortcut**, because it is reserved for navigation. **Backspace** cancels while still on the confirmation page.
 5. Watch the progress indicator. Programming progress tracks EEPROM write acknowledgements, then completes **two full verification reads**. **100% means the entire EEPROM was verified.**
 
 **Never disconnect or power down during a write.** Once physical programming begins there is **no mid-write cancellation**. If interrupted or reported unsuccessful, the EEPROM may be partially programmed; retain the prewrite backup for recovery.
+
+## Onboard SD file manager
+
+Press **`F`** on the Cardputer home screen to open **SD File Manager**. It uses the existing FAT32 card and is limited to the `/EEPROMs/` area, where M5 Prom keeps console folders, EEPROM backups and HDD recovery reports. **Load** and **Verify** remain separate commands on the home screen.
+
+| Where | Key | Action |
+|---|---|---|
+| Folder list | `W` / `S`, `Enter` | Choose a folder and open its files. |
+| Folder list | `N` | Create a folder. |
+| Folder list | `R` | Rename the selected folder. |
+| Folder list | `X` | Delete the selected folder **only if empty**. |
+| File list | `W` / `S`, `Enter` | Browse files. Enter displays EEPROM `.BIN` information or opens a `.TXT` report. |
+| File list | `R` | Rename the selected file, keeping its `.BIN` or `.TXT` extension. |
+| File list | `C` | Copy the selected file to a chosen console folder, including its current folder. |
+| File list | `X` | Delete the selected file. |
+| File list | `V` on a `.BIN` | Compare that image with the attached EEPROM using read-only Verify. |
+| TXT viewer | `W` / `S` | Scroll by one displayed line. |
+| TXT viewer | `A` / `D` | Scroll by one page. |
+| Name editor | `Enter` / `Esc` | Save the new name or cancel. Backspace deletes characters. |
+| Delete confirmation | `Y`, release, `Enter` | Arm and then delete; Backspace cancels. |
+
+Copying uses a new file and verifies its contents after writing. **Existing files are never intentionally overwritten.** When copying into the same folder, names such as `ORIGINAL_0001_C01.BIN` are generated automatically. A folder containing backups cannot be deleted until its contents are removed individually; there is no recursive deletion.
+
+The handheld browser shows supported `.BIN` and `.TXT` files only, with a current limit of 40 entries per folder/list; larger collections can be managed through the desktop Remote or Web Files. Filenames must use letters, numbers, hyphens, underscores or periods (maximum 31 characters), with no path separators. TXT viewing is read-only and wraps lines to the screen width; very long text files show their first 64 KiB. The file manager does not program the Xbox EEPROM, modify the loaded RAM image or reformat the SD card. It shares the same SD access lock as the web and USB file managers.
 
 ## M5 Prom Remote — USB desktop companion
 
@@ -144,7 +175,7 @@ For Windows, double-click **`remote/M5Prom-Remote.bat`**. The launcher creates a
 
 Choose **M5 Prom Native USB** and click **Connect**. Its physical LCD switches to **PC MODE ACTIVE**, while the normal application menus remain fully accessible in the remote window. Click the PC display to give it keyboard focus; Enter, arrows, Esc/Backspace, Tab and ordinary M5 Prom shortcuts all work. After disconnect or lost USB heartbeat, the Cardputer resumes local use automatically.
 
-**Optimized native USB mirroring:** The current Pass 2 firmware batches multiple changed, CRC-protected screen rows per transfer and uses RGB565 compression where supported. Compression is negotiated automatically. The runtime connection uses the native USB vendor interface rather than the former serial/COM protocol; install matching native-USB firmware and desktop app.
+**Native USB mirroring:** The companion transmits only changed framebuffer regions and uses compression where beneficial. The application uses USB-OTG rather than a normal runtime serial COM port; use matching native-USB firmware and desktop app.
 
 **File manager:** View, upload, download, rename and delete files, or create new folders in the existing FAT32 filesystem. Transfers are serialized behind the same protection used by EEPROM reads/writes and the web manager. The PC cannot mount the SD card as raw USB Mass Storage. The device continues to enforce all existing EEPROM write confirmation and backup requirements.
 
@@ -154,17 +185,11 @@ Choose **M5 Prom Native USB** and click **Connect**. Its physical LCD switches t
 
 See [`remote/README.md`](remote/README.md) for a user walkthrough and [`remote/PROTOCOL.md`](remote/PROTOCOL.md) for the optional technical details. Installing this patched firmware does not require installing the PC software; M5 Prom still runs standalone.
 
-**Remote performance diagnostics (Pass 1):** The companion reports USB transfer rates, completed-screen FPS, keyboard acknowledgements, queue drops and available internal RAM. Select **Export Diagnostics CSV** to capture measurements for troubleshooting. The USB task sleeps on USB/display notifications rather than zero-tick polling. See [`PASS1_USB_DIAGNOSTICS.md`](PASS1_USB_DIAGNOSTICS.md) for the test plan.
-
-**Remote throughput (Pass 2):** The firmware groups CRC-protected screen rows into
-larger USB submissions while preserving the v1 stream, and reserves USB TX FIFO
-space for keyboard acknowledgements. The default endpoint transfer buffer is now
-8192 bytes; existing ESP-IDF `sdkconfig` files must be updated separately. No
-changes to the GUI workflow are required. See [`PASS2_USB_TRANSPORT.md`](PASS2_USB_TRANSPORT.md).
+**Performance diagnostics:** The desktop companion can show screen FPS, USB transfer rates, key acknowledgements and queue/heap information. Use **Export Diagnostics CSV** when troubleshooting responsiveness. See [`remote/README.md`](remote/README.md) for the viewer and file-transfer controls.
 
 ## microSD and files
 
-The card uses its **existing FAT32 filesystem**, mounted internally at `/sdcard`. EEPROM backup and donor files are stored as normal files (not raw SD sectors):
+The card uses its **existing FAT32 filesystem**, mounted internally at `/sdcard`. EEPROM backups, donor images and text reports are stored as normal files (not raw SD sectors), accessible through the built-in file manager or from a PC:
 
 ```text
 /EEPROMs/
@@ -173,7 +198,8 @@ The card uses its **existing FAT32 filesystem**, mounted internally at `/sdcard`
     ├── DONOR_0001.BIN
     ├── PREWRITE_0001.BIN
     ├── TO_WRITE_0001.BIN
-    └── HDDKEY_0001.TXT        # Xbox HDD key; optional drive-specific ATA password
+    ├── HDDKEY_0001.TXT        # Xbox HDD key; optional drive-specific ATA password
+    └── ORIGINAL_0001_C01.BIN  # Example onboard file-manager copy
 ```
 
 File names and sequence numbers vary by operation. M5 Prom also supports a fallback folder name when the serial number is invalid. Each EEPROM image is **exactly 256 bytes**, with a new version created instead of overwriting an existing file. Treat backups as sensitive: they contain console-specific identity and security material.

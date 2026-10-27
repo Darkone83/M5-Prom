@@ -50,29 +50,3 @@ unchanged physical PC MODE card is not retransferred over SPI after each PC
 keyboard operation. USB packet checksums and original SD transfer formats are
 unchanged.
 
-## Pass 1 optional diagnostics (backward-compatible)
-
-`HELLO_ACK.flags & 0x10` indicates the device implements the optional Pass 1
-telemetry extension. The base protocol version stays 1. Without this bit, the
-host sends the original two-byte `KEY(type,ascii)` and does not request stats.
-
-- `07 PERF_REQUEST`: zero-length host request, normally once a second.
-- `84 PERF_REPLY`: 56-byte payload packed as little-endian `<BBH12IHH>`:
-  `version=1`, reserved byte, FreeRTOS tick length in ms, followed by twelve
-  `uint32`: uptime_ms, USB_RX_bytes, completed_USB_TX_bytes, frames_queued,
-  keys_queued, keys_rendered, keys_dropped, screen_TX_backpressure_events,
-  missed_framebuffer_publish_locks, diagnostic_ACK_drops, free_internal_heap_bytes,
-  minimum_free_internal_heap_bytes. Last two `uint16`: peak_key_queue_depth,
-  remote_task_stack_watermark_bytes. Counters wrap modulo 2³².
-- `03 KEY(type,ascii,sequence:u16le)` is accepted in addition to the original
-  two-byte form. `sequence=65535` is reserved for legacy untracked keys.
-- `83 KEY_STATUS(sequence:u16le,status:u8,device_delay_ms:u16le)`:
-  `status=0` accepted into key queue, `status=1` returned from UI handler/render,
-  `status=2` discarded because the bounded queue was full. Delays saturate at
-  65535 ms. Status packets may be delayed by USB IN backlog; they are
-  measurement aids, not timing guarantees or flow-control signals.
-
-An ACK or a queued frame is **not equivalent** to a frame physically displayed
-by Windows; the remote app measures the latter separately in a subsequent pass.
-This extension does not modify EEPROM read/write, SD operations or the original
-RGB565 compression protocol.

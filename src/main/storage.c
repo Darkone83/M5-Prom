@@ -59,6 +59,8 @@ static esp_err_t report_error(const char *stage,int num)
     switch(num){
         case EACCES: case EROFS: reason="SD READ-ONLY";hint="CHECK SD WRITE ACCESS";break;
         case ENOSPC: reason="SD CARD FULL";hint="FREE SPACE ON FAT32 CARD";break;
+        case EEXIST: reason="FILE OR FOLDER ALREADY EXISTS";hint="CHOOSE A NEW NAME";break;
+        case ENOTEMPTY: reason="FOLDER NOT EMPTY";hint="DELETE FILES BEFORE FOLDER";break;
         case EINVAL: case ENAMETOOLONG:
             reason="FAT INVALID / LONG FILE NAME";
             hint="ENABLE FATFS LONG FILENAMES";
@@ -74,7 +76,10 @@ static esp_err_t report_error(const char *stage,int num)
     }
     snprintf(last_stage,sizeof(last_stage),"%s",stage);
     last_errno=num;
-    if(num==EIO||num==ENODEV||num==EROFS||num==EACCES||num==ENOSPC)ready=false;
+    /* A failed per-file operation does NOT change FAT mount state.  In
+     * particular EACCES, EROFS and ENOSPC must not globally disable the
+     * existing card or prevent other file manager operations. */
+    if(num==ENODEV)ready=false;
     snprintf(last_error,sizeof(last_error),"%.16s: %s",stage,reason);
     snprintf(last_hint,sizeof(last_hint),"%s",hint);
     ESP_LOGE(TAG,"%s failed: errno=%d (%s); %s",stage,num,strerror(num),hint);
@@ -227,7 +232,7 @@ esp_err_t storage_remount(void)
 
 static bool valid_part(const char *name)
 {
-    if(!name||!name[0]||strlen(name)>=STORAGE_NAME_SIZE||strstr(name,".."))return false;
+    if(!name||!name[0]||!strcmp(name,".")||strlen(name)>=STORAGE_NAME_SIZE||strstr(name,".."))return false;
     for(const char *p=name;*p;p++){
         if(!(isalnum((unsigned char)*p)||*p=='_'||*p=='-'||*p=='.'))return false;
     }
@@ -442,4 +447,247 @@ esp_err_t storage_save_hdd_report(const char *folder,const char *report,size_t r
     snprintf(last_error,sizeof(last_error),"HDD TXT NUMBERS EXHAUSTED");
     snprintf(last_hint,sizeof(last_hint),"REMOVE OLD HDDKEY FILES");
     return ESP_ERR_NO_MEM;
+}
+
+
+/* ---------------- Onboard EEPROM file management -------------------------
+ * Only the managed /EEPROMs tree is reachable. Small streaming buffers keep
+ * operations usable on stock Cardputer RAM. No recursive folder deletion.
+ */
+static bool managed_file(const char *name)
+{
+    if(!valid_part(name))return false;
+    const size_t n=strlen(name);
+    return n>4 && (!strcasecmp(name+n-4,".BIN") || !strcasecmp(name+n-4,".TXT"));
+}
+static bool same_extension(const char *a,const char *b)
+{
+    const size_t na=strlen(a),nb=strlen(b);
+    return na>4&&nb>4&&!strcasecmp(a+na-4,b+nb-4);
+}
+static bool manager_path(char *out,size_t len,const char *folder,const char *file)
+{
+    if(!valid_part(folder) || (file && !managed_file(file)))return false;
+    const int n=file?snprintf(out,len,"%s/%s/%s",ROOT,folder,file):
+                     snprintf(out,len,"%s/%s",ROOT,folder);
+    return n>0&&(size_t)n<len;
+}
+static esp_err_t manager_validate_file(const char *folder,const char *name,
+                                      char path[160],struct stat *st)
+{
+    if(!ready)return ESP_ERR_INVALID_STATE;
+    if(!manager_path(path,160,folder,name))return ESP_ERR_INVALID_ARG;
+    if(stat(path,st)!=0)return report_error("FM LOOKUP",errno);
+    if(!S_ISREG(st->st_mode))return ESP_ERR_INVALID_ARG;
+    return ESP_OK;
+}
+size_t storage_manager_scan_files(const char *folder,
+                                  char names[][STORAGE_NAME_SIZE],size_t maximum)
+{
+    if(!ready||!valid_part(folder)||!names||!maximum)return 0;
+    char path[128];snprintf(path,sizeof(path),"%s/%s",ROOT,folder);
+    DIR *d=opendir(path);if(!d)return 0;
+    size_t n=0;struct dirent *ent;
+    while((ent=readdir(d))!=NULL&&n<maximum){
+        if(!managed_file(ent->d_name))continue;
+        char file[160];struct stat st;
+        if(!manager_path(file,sizeof(file),folder,ent->d_name))continue;
+        if(stat(file,&st)!=0 || !S_ISREG(st.st_mode))continue;
+        size_t name_length=strlen(ent->d_name);
+        if(name_length>=STORAGE_NAME_SIZE)continue;
+        memcpy(names[n++],ent->d_name,name_length+1);
+    }
+    closedir(d);
+    qsort(names,n,STORAGE_NAME_SIZE,names_compare);
+    return n;
+}
+esp_err_t storage_manager_create_folder(const char *name)
+{
+    if(!ready)return ESP_ERR_INVALID_STATE;
+    char path[160];
+    if(!manager_path(path,sizeof(path),name,NULL))return ESP_ERR_INVALID_ARG;
+    if(mkdir(path,0775)!=0)return report_error("FM NEW FOLDER",errno);
+    report_ok("FM FOLDER CREATED");return ESP_OK;
+}
+esp_err_t storage_manager_rename_folder(const char *old_name,const char *new_name)
+{
+    if(!ready)return ESP_ERR_INVALID_STATE;
+    char old_path[160],new_path[160];struct stat st;
+    if(!manager_path(old_path,sizeof(old_path),old_name,NULL) ||
+       !manager_path(new_path,sizeof(new_path),new_name,NULL))return ESP_ERR_INVALID_ARG;
+    if(!strcmp(old_name,new_name))return ESP_OK;
+    if(stat(old_path,&st)!=0)return report_error("FM FOLDER LOOKUP",errno);
+    if(!S_ISDIR(st.st_mode))return ESP_ERR_INVALID_ARG;
+    if(stat(new_path,&st)==0)return report_error("FM FOLDER EXISTS",EEXIST);
+    if(errno!=ENOENT)return report_error("FM FOLDER CHECK",errno);
+    if(rename(old_path,new_path)!=0)return report_error("FM FOLDER RENAME",errno);
+    report_ok("FM FOLDER RENAMED");return ESP_OK;
+}
+esp_err_t storage_manager_delete_empty_folder(const char *name)
+{
+    if(!ready)return ESP_ERR_INVALID_STATE;
+    char path[160];
+    if(!manager_path(path,sizeof(path),name,NULL))return ESP_ERR_INVALID_ARG;
+    /* rmdir explicitly refuses directories containing backups or reports. */
+    if(rmdir(path)!=0)return report_error("FM REMOVE EMPTY",errno);
+    report_ok("FM EMPTY FOLDER REMOVED");return ESP_OK;
+}
+esp_err_t storage_manager_file_size(const char *folder,const char *name,size_t *size)
+{
+    if(!size)return ESP_ERR_INVALID_ARG;
+    char path[160];struct stat st;
+    esp_err_t err=manager_validate_file(folder,name,path,&st);
+    if(err!=ESP_OK)return err;
+    *size=(size_t)st.st_size;
+    return ESP_OK;
+}
+esp_err_t storage_manager_rename_file(const char *folder,const char *old_name,const char *new_name)
+{
+    if(!managed_file(new_name)||!managed_file(old_name)||!same_extension(old_name,new_name))
+        return ESP_ERR_INVALID_ARG;
+    char from[160],to[160];struct stat st;
+    esp_err_t err=manager_validate_file(folder,old_name,from,&st);
+    if(err!=ESP_OK)return err;
+    if(!strcmp(old_name,new_name))return ESP_OK;
+    if(!manager_path(to,sizeof(to),folder,new_name))return ESP_ERR_INVALID_ARG;
+    if(stat(to,&st)==0)return report_error("FM NAME EXISTS",EEXIST);
+    if(errno!=ENOENT)return report_error("FM NAME CHECK",errno);
+    if(rename(from,to)!=0)return report_error("FM RENAME",errno);
+    report_ok("FM FILE RENAMED");return ESP_OK;
+}
+/* Exclusive-copy algorithm: an existing name is never overwritten. Same-folder
+ * and occupied cross-folder copies receive _C01, _C02 ... suffixes before the
+ * original extension. We only expose the filename after readback compares.
+ */
+esp_err_t storage_manager_copy_file(const char *from_folder,const char *name,
+                                    const char *to_folder,char *copy_name,size_t copy_size)
+{
+    if(copy_name&&copy_size)copy_name[0]=0;
+    if(!copy_name||copy_size<STORAGE_NAME_SIZE||!valid_part(to_folder))return ESP_ERR_INVALID_ARG;
+    char from[160],to[160],dest_dir[128];struct stat st;
+    esp_err_t err=manager_validate_file(from_folder,name,from,&st);
+    if(err!=ESP_OK)return err;
+    if(!manager_path(dest_dir,sizeof(dest_dir),to_folder,NULL))return ESP_ERR_INVALID_ARG;
+    if(!is_folder(dest_dir))return ESP_ERR_NOT_FOUND;
+    FILE *input=fopen(from,"rb");if(!input)return report_error("FM COPY OPEN",errno);
+    int fd=-1;
+    char target[STORAGE_NAME_SIZE]={0};
+    const size_t src_len=strlen(name);
+    const size_t stem_len=src_len-4;
+    const char *ext=name+stem_len;
+    for(unsigned i=0;i<=99;i++){
+        if(i==0 && strcmp(from_folder,to_folder)!=0)
+            snprintf(target,sizeof(target),"%s",name);
+        else{
+            const unsigned serial=i?i:1;
+            /* At most 23 stem bytes + _Cxx + 4 extension = 31 chars. */
+            const size_t clip=stem_len<23?stem_len:23;
+            snprintf(target,sizeof(target),"%.*s_C%02u%s",(int)clip,name,serial,ext);
+        }
+        if(!manager_path(to,sizeof(to),to_folder,target)){fclose(input);return ESP_ERR_INVALID_ARG;}
+        fd=open(to,O_WRONLY|O_CREAT|O_EXCL,0644);
+        if(fd>=0)break;
+        if(errno!=EEXIST){int e=errno;fclose(input);return report_error("FM COPY CREATE",e);}
+    }
+    if(fd<0){fclose(input);return report_error("FM COPY NAME",EEXIST);}
+    unsigned char buf[256];bool ok=true;int error=EIO;
+    for(;;){
+        size_t n=fread(buf,1,sizeof(buf),input);
+        if(n){
+            size_t done=0;
+            while(done<n){ssize_t w=write(fd,buf+done,n-done);
+                if(w<=0){ok=false;error=w<0?errno:ENOSPC;break;}
+                done+=(size_t)w;
+            }
+        }
+        if(!ok)break;
+        if(n<sizeof(buf)){
+            if(ferror(input)){ok=false;error=EIO;}
+            break;
+        }
+    }
+    if(ok && fsync(fd)!=0){ok=false;error=errno;}
+    if(close(fd)!=0){ok=false;error=errno;}
+    if(fclose(input)!=0){ok=false;error=EIO;}
+    if(ok){
+        FILE *a=fopen(from,"rb"),*b=fopen(to,"rb");
+        if(!a||!b){ok=false;error=errno;}
+        else{
+            unsigned char left[256],right[256];
+            for(;;){
+                size_t n=fread(left,1,sizeof(left),a);
+                size_t m=fread(right,1,sizeof(right),b);
+                if(n!=m||memcmp(left,right,n)!=0 || ferror(a)||ferror(b)){
+                    ok=false;error=EIO;break;
+                }
+                if(n<sizeof(left))break;
+            }
+        }
+        if(a&&fclose(a)!=0){ok=false;error=EIO;}
+        if(b&&fclose(b)!=0){ok=false;error=EIO;}
+    }
+    memset(buf,0,sizeof(buf));
+    if(!ok){(void)unlink(to);return report_error("FM COPY VERIFY",error);}
+    snprintf(copy_name,copy_size,"%s",target);
+    report_ok("FM COPY VERIFIED");return ESP_OK;
+}
+esp_err_t storage_manager_delete_file(const char *folder,const char *name)
+{
+    char path[160];struct stat st;
+    esp_err_t err=manager_validate_file(folder,name,path,&st);
+    if(err!=ESP_OK)return err;
+    if(unlink(path)!=0)return report_error("FM FILE DELETE",errno);
+    report_ok("FM FILE DELETED");return ESP_OK;
+}
+/* Bounded, streaming text pager with fixed RAM footprint. Handles CRLF,
+ * wraps long lines and makes non-printable bytes safe for the 5x7 font.
+ * Other file types and arbitrary paths cannot enter the viewer.
+ */
+esp_err_t storage_manager_text_page(const char *folder,const char *name,size_t first_line,
+                     char lines[STORAGE_TEXT_ROWS][STORAGE_TEXT_COLS+1],
+                     size_t *total_lines,bool *truncated)
+{
+    if(!lines||!total_lines||!truncated)return ESP_ERR_INVALID_ARG;
+    memset(lines,0,STORAGE_TEXT_ROWS*(STORAGE_TEXT_COLS+1));
+    *total_lines=0;*truncated=false;
+    if(!managed_file(name)||strcasecmp(name+strlen(name)-4,".TXT"))return ESP_ERR_INVALID_ARG;
+    char path[160];struct stat st;
+    esp_err_t err=manager_validate_file(folder,name,path,&st);
+    if(err!=ESP_OK)return err;
+    FILE *file=fopen(path,"rb");if(!file)return report_error("FM TXT OPEN",errno);
+    char current[STORAGE_TEXT_COLS+1]={0};
+    size_t col=0,count=0,bytes=0;
+    bool failed=false,previous_newline=false;
+    int ch;
+    while(bytes<65536 && (ch=fgetc(file))!=EOF){
+        bytes++;
+        if(ch=='\r')continue;
+        if(ch=='\n'){
+            current[col]=0;
+            if(count>=first_line && count<first_line+STORAGE_TEXT_ROWS)
+                snprintf(lines[count-first_line],STORAGE_TEXT_COLS+1,"%s",current);
+            count++;col=0;current[0]=0;previous_newline=true;
+            continue;
+        }
+        previous_newline=false;
+        if(col==STORAGE_TEXT_COLS){
+            current[col]=0;
+            if(count>=first_line && count<first_line+STORAGE_TEXT_ROWS)
+                snprintf(lines[count-first_line],STORAGE_TEXT_COLS+1,"%s",current);
+            count++;col=0;current[0]=0;
+        }
+        current[col++]=(ch=='\t')?' ':((ch>=32&&ch<=126)?(char)ch:'?');
+    }
+    if(ferror(file))failed=true;
+    if(!failed && bytes==65536 && (ch=fgetc(file))!=EOF) *truncated=true;
+    if(fclose(file)!=0)failed=true;
+    if(failed)return report_error("FM TXT READ",EIO);
+    if(col || (!count&&!previous_newline)){
+        current[col]=0;
+        if(count>=first_line && count<first_line+STORAGE_TEXT_ROWS)
+            snprintf(lines[count-first_line],STORAGE_TEXT_COLS+1,"%s",current);
+        count++;
+    }
+    *total_lines=count;
+    return ESP_OK;
 }

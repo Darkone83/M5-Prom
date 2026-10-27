@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <ctype.h>
+#include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -18,6 +19,7 @@
 #include "keyboard.h"
 #include "eeprom.h"
 #include "storage.h"
+#include "sd_browser.h"
 #include "image.h"
 #include "hdd_recovery.h"
 #include "donor.h"
@@ -38,13 +40,16 @@ typedef enum {
     PAGE_TEXT_EDIT,PAGE_CONFIRM_FIX,PAGE_CONFIRM_DISCARD,
     PAGE_FOLDERS,PAGE_FILES,PAGE_PINS,PAGE_DONOR_MODE,PAGE_DONOR,PAGE_CONFIRM_WRITE,PAGE_BATTERY,
     PAGE_SETTINGS,PAGE_WIFI_SCAN,PAGE_WIFI_PASSWORD,PAGE_WIFI_STATUS,PAGE_DIAGNOSTICS,
-    PAGE_HDD_RECOVERY,PAGE_HDD_FIELD_EDIT,PAGE_HDD_ATA_PASSWORD
+    PAGE_HDD_RECOVERY,PAGE_HDD_FIELD_EDIT,PAGE_HDD_ATA_PASSWORD,
+    PAGE_FM_FOLDERS,PAGE_FM_FILES,PAGE_FM_EDIT,PAGE_FM_COPY_DEST,
+    PAGE_FM_DELETE,PAGE_FM_TXT,PAGE_FM_BIN_INFO,PAGE_FM_NOTICE,PAGE_FM_HELP
 } page_t;
 typedef enum {PENDING_NONE=0,PENDING_READ,PENDING_LOAD,PENDING_DONOR} pending_t;
-typedef enum {BROWSER_OPEN=0,BROWSER_DONOR_SOURCE} browser_purpose_t;
+typedef enum {BROWSER_OPEN=0,BROWSER_DONOR_SOURCE,BROWSER_VERIFY} browser_purpose_t;
 static page_t page=PAGE_MENU;
 static pending_t pending=PENDING_NONE;
 static browser_purpose_t browser_purpose=BROWSER_OPEN;
+static page_t verify_return_page=PAGE_MENU;
 static image_session_t session;
 static image_fix_field_t pending_fix;
 static image_edit_field_t text_field;
@@ -89,6 +94,32 @@ static char hdd_ata_password[HDD_ATA_PASSWORD_HEX_SIZE];
 static size_t hdd_edit_len=0;
 static bool hdd_edit_model=true,hdd_entry_error=false;
 
+/* Onboard file manager is rooted at /EEPROMs and never navigates outside it.
+ * It shares the mounted FAT32 VFS and operation guard with all EEPROM tools.
+ */
+#define FM_ROOT_DIR "EEPROMs"
+typedef enum {FM_EDIT_NEW_FOLDER=0,FM_EDIT_RENAME} fm_edit_action_t;
+static char fm_dir[SD_BROWSER_DIR_MAX];
+static char fm_target[SD_BROWSER_NAME_MAX];
+static char fm_name_input[SD_BROWSER_NAME_MAX];
+static size_t fm_name_length=0;
+static fm_edit_action_t fm_edit_action=FM_EDIT_RENAME;
+static bool fm_name_error=false,fm_target_dir=false,fm_delete_armed=false;
+static bool fm_copy_mode=false;
+static char fm_copy_source_dir[SD_BROWSER_DIR_MAX];
+static char fm_copy_source_name[SD_BROWSER_NAME_MAX];
+static char fm_saved_dir[SD_BROWSER_DIR_MAX];
+static size_t fm_saved_offset=0;
+static int fm_saved_selection=0;
+static sd_browser_entry_t fm_items[SD_BROWSER_PAGE_SIZE];
+static size_t fm_count=0,fm_total=0,fm_offset=0;
+static int fm_selected=0;
+static bool fm_notice_good=false;
+static char fm_notice_title[38],fm_notice_detail[72];
+static size_t fm_text_start=0,fm_text_total=0;
+static bool fm_text_truncated=false;
+static char fm_text_rows[STORAGE_TEXT_ROWS][STORAGE_TEXT_COLS+1];
+static uint64_t fm_file_size=0;
 
 #define WIDTH 240
 #define LIST_FIRST_Y 46
@@ -301,13 +332,14 @@ static void progress_draw(const char *title,const char *phase,unsigned percent,
     footer("KEEP USB / XBOX / SD CONNECTED");
     display_present();
 }
-typedef enum {OP_PROGRESS_READ=0,OP_PROGRESS_PREWRITE,OP_PROGRESS_COMMIT} progress_job_t;
+typedef enum {OP_PROGRESS_READ=0,OP_PROGRESS_PREWRITE,OP_PROGRESS_COMMIT,OP_PROGRESS_VERIFY} progress_job_t;
 static void on_eeprom_progress(void *ctx,eeprom_progress_phase_t phase,
                                unsigned completed,unsigned total)
 {
     progress_job_t job=*(const progress_job_t *)ctx;
     const char *title=job==OP_PROGRESS_READ?"READ EEPROM":
-                      job==OP_PROGRESS_PREWRITE?"PREPARE WRITE":"WRITE EEPROM";
+                      job==OP_PROGRESS_PREWRITE?"PREPARE WRITE":
+                      job==OP_PROGRESS_VERIFY?"VERIFY EEPROM":"WRITE EEPROM";
     const char *step="PROBING EEPROM";
     unsigned percent=0;
     if(job==OP_PROGRESS_COMMIT){
@@ -324,9 +356,11 @@ static void on_eeprom_progress(void *ctx,eeprom_progress_phase_t phase,
             case EEPROM_PROGRESS_VERIFIED:step="FULL READBACK VERIFIED";percent=100;break;
         }
     }else{
-        unsigned top=job==OP_PROGRESS_PREWRITE?42:75;
+        unsigned top=job==OP_PROGRESS_PREWRITE?42:
+                     job==OP_PROGRESS_VERIFY?85:75;
         switch(phase){
-            case EEPROM_PROGRESS_PROBE:step="DETECTING EEPROM 0X54";percent=3;break;
+            case EEPROM_PROGRESS_PROBE:step="DETECTING EEPROM 0X54";
+                percent=job==OP_PROGRESS_VERIFY?15:3;break;
             case EEPROM_PROGRESS_READ_FIRST:step="CHIP READ / PASS 1";percent=top/2;break;
             case EEPROM_PROGRESS_READ_SECOND:step="CHIP READ / PASS 2";percent=top-3;break;
             case EEPROM_PROGRESS_READ_MATCH:step="TWO READS MATCHED";percent=top;break;
@@ -454,7 +488,7 @@ static void render_menu(void)
     display_rect(0,114,WIDTH,1,UI_LINE);
     fit_text(8,116,menu_tips[menu_selected],37,
              menu_selected==6?UI_WARN:UI_WHITE,1);
-    display_text(8,126,"0:SET M:FX B:BAT P:PIN H:HDD",UI_MUTED,1);
+    display_text(8,126,"0:SET F:FILES H:HDD V:CHK B:BAT",UI_MUTED,1);
     char index[4]={(char)('1'+menu_selected),'/', '9',0};
     display_text(211,126,index,UI_ACCENT,1);
 }
@@ -601,14 +635,123 @@ static void render_confirm_discard(void)
 static void render_browser(bool folders)
 {
     int count=(int)(folders?folder_count:file_count);
-    header(folders?"EEPROM FOLDERS":"SELECT EEPROM BIN",folders?"/EEPROMs/":selected_folder);
+    const bool verifying=(browser_purpose==BROWSER_VERIFY);
+    header(folders?"EEPROM FOLDERS":verifying?"VERIFY EEPROM":"SELECT EEPROM BIN",
+           folders?"/EEPROMs/":selected_folder);
     if(count==0)display_text(12,63,folders?"NO SERIAL FOLDERS":"NO .BIN FILES",UI_WARN,1);
     int start=list_start(list_selected,count);
     for(int i=start;i<count&&i<start+LIST_VISIBLE;i++)
         list_item(LIST_FIRST_Y+(i-start)*LIST_STEP,folders?folder_list[i]:file_list[i],
                   i==list_selected,NULL,UI_WHITE);
     scrollbar(list_selected,count);
-    footer_indexed("W/S MOVE  ENTER SELECT  BACK",list_selected,count);
+    footer_indexed(folders?"W/S MOVE ENTER OPEN BACK":
+                   verifying?"W/S MOVE ENTER VERIFY BACK":
+                   browser_purpose==BROWSER_OPEN?"W/S MOVE ENT LOAD V VERIFY":
+                   "W/S MOVE ENTER SELECT BACK",list_selected,count);
+}
+/* EEPROMs-scoped FAT32 manager. The list is paginated and accepts normal files. */
+static void render_fm_files(void)
+{
+    header("EEPROM FILE MANAGER",fm_dir[0]?fm_dir:"/EEPROMs");
+    if(!fm_count)display_text(12,65,"EMPTY FOLDER - N TO CREATE",UI_WARN,1);
+    int first=list_start(fm_selected,(int)fm_count);
+    for(int i=first;i<(int)fm_count&&i<first+LIST_VISIBLE;i++){
+        const sd_browser_entry_t *v=&fm_items[i];
+        const char *type=v->directory?"DIR": "FILE";
+        size_t n=strlen(v->name);
+        if(!v->directory && n>=4 && !strcasecmp(v->name+n-4,".TXT"))type="TXT";
+        if(!v->directory && n>=4 && !strcasecmp(v->name+n-4,".BIN"))type="BIN";
+        list_item(LIST_FIRST_Y+(i-first)*LIST_STEP,v->name,i==fm_selected,type,
+                  v->directory?UI_CYAN:UI_WHITE);
+    }
+    scrollbar(fm_selected,(int)fm_count);
+    char help[38];
+    snprintf(help,sizeof(help),"H HELP R NAME C COPY X DEL");
+    footer(help);
+    char page_text[14];
+    unsigned pos=(unsigned)(fm_offset+(fm_count?(size_t)fm_selected+1:0));
+    snprintf(page_text,sizeof(page_text),"%u/%u",pos,(unsigned)fm_total);
+    display_rect(192,121,48,13,UI_HEADER);
+    fit_text(193,124,page_text,7,UI_ACCENT,1);
+}
+static void render_fm_folders(void){render_fm_files();}
+static void render_fm_edit(void)
+{
+    header(fm_edit_action==FM_EDIT_NEW_FOLDER?"NEW FOLDER":"RENAME ITEM",
+           fm_dir[0]?fm_dir:"/EEPROMs");
+    display_text(12,48,"NAME / FAT32 FILESYSTEM",UI_MUTED,1);
+    display_rect(8,60,224,29,UI_PANEL);
+    display_frame(8,60,224,29,fm_name_error?UI_BAD:UI_ACCENT);
+    size_t n=strlen(fm_name_input);
+    fit_text(14,70,fm_name_input+n-(n>34?34:n),34,UI_WHITE,1);
+    if(fm_name_error)fit_text(12,100,"INVALID NAME OR WRITE FAILED",35,UI_BAD,1);
+    else fit_text(12,100,"SPACES / STANDARD FILENAMES OK",35,UI_MUTED,1);
+    footer("ENTER SAVE  BACKSPACE DEL  ESC");
+}
+static void render_fm_copy_dest(void)
+{
+    header("COPY DESTINATION",fm_dir[0]?fm_dir:"/EEPROMs");
+    int first=list_start(fm_selected,(int)fm_count);
+    if(!fm_count)display_text(12,65,"NO FOLDERS / P COPY HERE",UI_MUTED,1);
+    for(int i=first;i<(int)fm_count&&i<first+LIST_VISIBLE;i++){
+        const sd_browser_entry_t *v=&fm_items[i];
+        if(v->directory)list_item(LIST_FIRST_Y+(i-first)*LIST_STEP,v->name,
+                                    i==fm_selected,"DIR",UI_CYAN);
+        else list_item(LIST_FIRST_Y+(i-first)*LIST_STEP,v->name,
+                       i==fm_selected,"FILE",UI_MUTED);
+    }
+    scrollbar(fm_selected,(int)fm_count);
+    footer("ENTER DIR  P PASTE  BACK / ESC");
+}
+static void render_fm_delete(void)
+{
+    header("DELETE SD ITEM",fm_delete_armed?"ARMED / PERMANENT":"CONFIRM BEFORE DELETING");
+    display_rect(7,47,226,65,UI_PANEL);
+    display_rect(7,47,3,65,UI_BAD);
+    fit_text(14,56,fm_target,35,UI_WHITE,1);
+    fit_text(14,76,fm_target_dir?"FOLDER AND ALL ITS CONTENTS":"THIS FILE WILL BE DELETED",35,UI_WARN,1);
+    display_text(14,96,fm_delete_armed?"ENTER TO DELETE":"PRESS Y TO ARM",UI_BAD,1);
+    footer(fm_delete_armed?"ENTER DELETE  BACK CANCEL":"Y ARM  BACK CANCEL");
+}
+static void render_fm_txt(void)
+{
+    header("VIEW TEXT",fm_target);
+    for(int i=0;i<STORAGE_TEXT_ROWS;i++)
+        fit_text(10,46+i*14,fm_text_rows[i],STORAGE_TEXT_COLS,UI_WHITE,1);
+    if(fm_text_truncated)display_rect(231,44,3,6,UI_WARN);
+    footer_indexed("W/S LINE  A/D PAGE  BACK",(int)fm_text_start,(int)fm_text_total);
+}
+static void render_fm_bin_info(void)
+{
+    header("FILE INFORMATION",fm_dir[0]?fm_dir:"/EEPROMs");
+    fit_text(12,50,fm_target,35,UI_WHITE,1);
+    char info[38];
+    snprintf(info,sizeof(info),"SIZE: %llu BYTES",(unsigned long long)fm_file_size);
+    fit_text(12,69,info,35,UI_CYAN,1);
+    const size_t n=strlen(fm_target);
+    bool bin=n>=4&&!strcasecmp(fm_target+n-4,".BIN");
+    display_text(12,88,bin&&fm_file_size==256?"XBOX EEPROM IMAGE":"STANDARD FAT32 FILE",
+                 UI_MUTED,1);
+    footer(bin&&fm_file_size==256?"V VERIFY AGAINST CHIP  BACK":"BACK RETURN TO FILES");
+}
+static void render_fm_notice(void)
+{
+    header("SD FILE OPERATION",fm_notice_good?"COMPLETED":"ATTENTION REQUIRED");
+    display_rect(7,47,226,65,UI_PANEL);
+    display_rect(7,47,3,65,fm_notice_good?UI_GOOD:UI_BAD);
+    fit_text(15,57,fm_notice_title,35,fm_notice_good?UI_GOOD:UI_BAD,1);
+    fit_text(15,87,fm_notice_detail,35,UI_WHITE,1);
+    footer("ENTER / BACK RETURN TO FILES");
+}
+static void render_fm_help(void)
+{
+    header("EEPROM FILE MANAGER","/EEPROMs / SD CARD");
+    display_text(10,46,"W/S MOVE  ENTER OPEN",UI_WHITE,1);
+    display_text(10,59,"BACK PARENT / H HELP",UI_WHITE,1);
+    display_text(10,72,"R RENAME  N NEW FOLDER",UI_WHITE,1);
+    display_text(10,85,"C COPY  X DELETE",UI_WHITE,1);
+    display_text(10,98,"P PASTE  V VERIFY BIN",UI_WHITE,1);
+    footer("ENTER / BACK TO BROWSER");
 }
 static void render_battery(void)
 {
@@ -913,7 +1056,7 @@ static void render_confirm_write(void)
     display_text(15,79,size_line,UI_MUTED,1);
     display_text(15,94,write_revision_mismatch?"WARNING: REVISION MISMATCH":
                  write_security_changes?"WARNING: HDD / SECURITY CHANGE":"CHECK TARGET AND IMAGE",UI_WARN,1);
-    footer(write_armed?"ENTER WRITE NOW / BACK CANCEL":"PRESS W TO ARM / BACK CANCEL");
+    footer(write_armed?"ENTER WRITE NOW / BACK CANCEL":"PRESS Y TO ARM / BACK CANCEL");
 }
 /* HDD Recovery: authenticated Xbox HDD key and an optional drive-specific
  * ATA USER password. All input is from the existing Cardputer/Remote keyboard
@@ -996,6 +1139,15 @@ static void render(void)
         case PAGE_HDD_RECOVERY:render_hdd_recovery();break;
         case PAGE_HDD_FIELD_EDIT:render_hdd_field_edit();break;
         case PAGE_HDD_ATA_PASSWORD:render_hdd_ata_password();break;
+        case PAGE_FM_FOLDERS:render_fm_folders();break;
+        case PAGE_FM_FILES:render_fm_files();break;
+        case PAGE_FM_EDIT:render_fm_edit();break;
+        case PAGE_FM_COPY_DEST:render_fm_copy_dest();break;
+        case PAGE_FM_DELETE:render_fm_delete();break;
+        case PAGE_FM_TXT:render_fm_txt();break;
+        case PAGE_FM_BIN_INFO:render_fm_bin_info();break;
+        case PAGE_FM_NOTICE:render_fm_notice();break;
+        case PAGE_FM_HELP:render_fm_help();break;
     }
     display_present();
 }
@@ -1066,6 +1218,7 @@ done:
     operation_guard_release();
 }
 static void do_copy_donor(const uint8_t raw[256]);
+static bool mount_sd_for_browser(void);
 static void open_folder_browser(void)
 {
     if(!acquire_operation_or_warn())return;
@@ -1082,9 +1235,86 @@ static void choose_folder(void)
     operation_guard_release();
     list_selected=0;page=PAGE_FILES;
 }
+/* Compare a selected SD image against two matching physical EEPROM reads.
+ * This never adopts the SD bytes as the working image, creates a new backup,
+ * programs the EEPROM, or bypasses the SD/web operation guard.
+ * A byte-for-byte match is independent of cryptographic EEPROM validity.
+ */
+static void verify_source_file(const char *folder,const char *name,bool from_file_manager)
+{
+    if(!acquire_operation_or_warn())return;
+    uint8_t expected[XBOX_EEPROM_SIZE]={0};
+    uint8_t physical[XBOX_EEPROM_SIZE]={0};
+    if(from_file_manager?!storage_mounted():!sd_ok){
+        show_message(false,"SD NOT READY","CHECK FAT32 CARD",
+                     "REOPEN VERIFY WHEN READY","NO EEPROM WRITE PERFORMED");goto release;
+    }
+    if(!i2c_ok){
+        show_message(false,"I2C NOT READY","CHECK GROVE / LPC CONNECTION",
+                     "NO EEPROM READ PERFORMED","NO DATA WAS MODIFIED");goto release;
+    }
+    progress_reset();
+    progress_draw("VERIFY EEPROM","READING SELECTED SD FILE",5,0,0,"256 BYTE REFERENCE IMAGE");
+    esp_err_t err=from_file_manager?sd_browser_read_eeprom(folder,name,expected):
+                                 storage_load_version(folder,name,expected);
+    if(err!=ESP_OK){
+        if(!from_file_manager)sd_ok=storage_ready();
+        show_message(false,"VERIFY SOURCE FAILED",
+                     from_file_manager?sd_browser_error():storage_last_error(),
+                     "NO EEPROM READ PERFORMED","NO DATA WAS MODIFIED");goto release;
+    }
+    progress_job_t job=OP_PROGRESS_VERIFY;
+    err=eeprom_read_verified_progress(physical,on_eeprom_progress,&job);
+    if(err!=ESP_OK){
+        refresh_eeprom_detection();
+        show_message(false,"VERIFY READ FAILED","TWO MATCHING READS REQUIRED",
+                     esp_err_to_name(err),"NO DATA WAS MODIFIED");goto release;
+    }
+    eeprom_checked=true;eeprom_detected=true;eeprom_probe_error=ESP_OK;
+    progress_draw("VERIFY EEPROM","COMPARING ALL 256 BYTES",93,0,0,"BYTE-FOR-BYTE CHIP VS SD");
+    unsigned differences=0,first=0;
+    for(unsigned i=0;i<XBOX_EEPROM_SIZE;i++){
+        if(expected[i]!=physical[i]){
+            if(!differences)first=i;
+            differences++;
+        }
+    }
+    progress_draw("VERIFY EEPROM","COMPARISON FINISHED",100,0,0,"NO DATA MODIFIED");
+    if(differences==0){
+        show_message(true,"EEPROM MATCH VERIFIED","256 / 256 BYTES MATCH",folder,
+                     "CHIP / SD / RAM UNCHANGED");
+        ESP_LOGI(TAG,"VERIFY PASS /EEPROMs/%s/%s: 256/256 bytes",folder,name);
+    }else{
+        char count[38],detail[38];
+        snprintf(count,sizeof(count),"%u / 256 BYTES DIFFER",differences);
+        snprintf(detail,sizeof(detail),"0X%02X SD:%02X CHIP:%02X",first,
+                 (unsigned)expected[first],(unsigned)physical[first]);
+        show_message(false,"EEPROM VERIFY MISMATCH",count,detail,
+                     "CHIP / SD / RAM UNCHANGED");
+        ESP_LOGW(TAG,"VERIFY FAIL /EEPROMs/%s/%s: %u differences; first at 0x%02X",
+                 folder,name,differences,first);
+    }
+release:
+    memset(expected,0,sizeof(expected));
+    memset(physical,0,sizeof(physical));
+    operation_guard_release();
+}
+static void verify_selected_file(const char *folder,const char *name)
+{
+    verify_source_file(folder,name,false);
+}
+static void verify_selected_manager_file(const char *folder,const char *name)
+{
+    verify_source_file(folder,name,true);
+}
 static void choose_file(void)
 {
     if(list_selected<0||list_selected>=(int)file_count)return;
+    if(browser_purpose==BROWSER_VERIFY){
+        browser_purpose=BROWSER_OPEN;
+        verify_selected_file(selected_folder,file_list[list_selected]);
+        return;
+    }
     if(!acquire_operation_or_warn())return;
     uint8_t raw[256];const char *name=file_list[list_selected];
     progress_reset();
@@ -1103,6 +1333,26 @@ static void choose_file(void)
     session.is_donor=strncmp(name,"DONOR_",6)==0;
     snprintf(session.folder,sizeof(session.folder),"%s",selected_folder);
     show_message(true,"IMAGE LOADED FROM SD",selected_folder,name,"OFFLINE - NO CHIP ACCESSED");
+}
+/* V from Home or Inspect opens the same FAT32 browser in read-only
+ * verification mode. No active working image is discarded or changed.
+ */
+static void start_verify_browser(void)
+{
+    if(!i2c_ok){
+        show_message(false,"I2C NOT READY","EEPROM VERIFICATION REQUIRES",
+                     "A WORKING LPC / GROVE LINK","");return;
+    }
+    if(!mount_sd_for_browser()){
+        if(page!=PAGE_RESULT)
+            show_message(false,"SD NOT AVAILABLE",storage_last_error(),
+                         storage_last_hint(),"NO DATA WAS MODIFIED");
+        return;
+    }
+    verify_return_page=page;
+    browser_purpose=BROWSER_VERIFY;
+    open_folder_browser();
+    if(page!=PAGE_FOLDERS)browser_purpose=BROWSER_OPEN;
 }
 static void begin_text_edit(image_edit_field_t field)
 {
@@ -1281,7 +1531,7 @@ static void do_prepare_write(void)
     }
     // Persist the intended image as well, so the operator can recover after a
     // partially completed write. The operation gate prevents web deletion or
-    // remount of either file while waiting for the final W + ENTER consent.
+    // remount of either file while waiting for the final Y, then ENTER consent.
     progress_draw("PREPARE WRITE","SAVING PROPOSED IMAGE",76,0,0,"TO_WRITE BACKUP");
     char source_name[STORAGE_NAME_SIZE];
     err=storage_save_version(session.folder,"TO_WRITE",session.working,
@@ -1485,6 +1735,255 @@ finish:
     operation_guard_release();
 }
 
+/* Onboard manager operates entirely within /EEPROMs. This is intentionally
+ * separate from USB / Web Files and from the Load / Verify picker.
+ */
+static void fm_status(bool ok,const char *title,const char *detail)
+{
+    fm_notice_good=ok;
+    snprintf(fm_notice_title,sizeof(fm_notice_title),"%s",title?title:"");
+    snprintf(fm_notice_detail,sizeof(fm_notice_detail),"%s",detail?detail:"");
+    sound_notify(ok);
+    page=PAGE_FM_NOTICE;
+}
+static void fm_error(esp_err_t err)
+{
+    const char *last=sd_browser_error();
+    if(err==ESP_ERR_INVALID_STATE)last="SD NOT MOUNTED / REMOUNT";
+    fm_status(false,"SD OPERATION FAILED",last);
+}
+static bool fm_guard(void)
+{
+    if(operation_guard_try_acquire())return true;
+    fm_status(false,"SD BUSY","FINISH WEB / USB TRANSFER");
+    return false;
+}
+static bool fm_dir_in_scope(void)
+{
+    const size_t n=sizeof(FM_ROOT_DIR)-1;
+    return strncmp(fm_dir,FM_ROOT_DIR,n)==0 &&
+           (fm_dir[n]=='\0' || fm_dir[n]=='/');
+}
+static bool fm_refresh(void)
+{
+    /* Never let the handheld browse the SD root or a non-EEPROM path. */
+    if(!fm_dir_in_scope()){
+        fm_status(false,"OUTSIDE EEPROMs","REOPEN FILE MANAGER");
+        return false;
+    }
+    if(!fm_guard())return false;
+    esp_err_t e=sd_browser_list(fm_dir,fm_offset,fm_items,SD_BROWSER_PAGE_SIZE,
+                                 &fm_count,&fm_total);
+    if(e==ESP_OK && fm_offset>=fm_total && fm_total){
+        fm_offset=((fm_total-1)/SD_BROWSER_PAGE_SIZE)*SD_BROWSER_PAGE_SIZE;
+        e=sd_browser_list(fm_dir,fm_offset,fm_items,SD_BROWSER_PAGE_SIZE,
+                          &fm_count,&fm_total);
+    }
+    operation_guard_release();
+    if(e!=ESP_OK){fm_error(e);return false;}
+    if(fm_selected >= (int)fm_count)fm_selected=fm_count?(int)fm_count-1:0;
+    if(fm_selected<0)fm_selected=0;
+    return true;
+}
+static bool fm_change_dir(const char *name)
+{
+    if(!fm_dir_in_scope() || !sd_browser_name_valid(name)){
+        fm_status(false,"INVALID FOLDER","CHECK NAME / EEPROM PATH");
+        return false;
+    }
+    /* Append in-place rather than keeping a second 480-byte pathname on the
+     * small ESP32-S3 main task stack. The folder name is held in fm_items. */
+    const size_t old_len=strlen(fm_dir);
+    const size_t name_len=strlen(name);
+    if(old_len+1+name_len>=sizeof(fm_dir)){
+        fm_status(false,"PATH TOO LONG","SELECT A SHORTER FOLDER");
+        return false;
+    }
+    fm_dir[old_len]='/';
+    memcpy(fm_dir+old_len+1,name,name_len+1);
+    const size_t prev_offset=fm_offset;
+    const int prev_selected=fm_selected;
+    fm_offset=0;fm_selected=0;
+    if(fm_refresh())return true;
+    /* Recover the previous directory if the new directory cannot be read. */
+    fm_dir[old_len]=0;
+    fm_offset=prev_offset;fm_selected=prev_selected;
+    return false;
+}
+static bool fm_parent(void)
+{
+    if(!fm_dir_in_scope() || !strcmp(fm_dir,FM_ROOT_DIR))return false;
+    char *sep=strrchr(fm_dir,'/');
+    if(!sep)return false;
+    *sep=0;
+    fm_offset=0;fm_selected=0;
+    return fm_refresh();
+}
+static void fm_move(int increment)
+{
+    if(!fm_count)return;
+    if(increment>0){
+        if(fm_selected<(int)fm_count-1){fm_selected++;return;}
+        if(fm_offset+fm_count<fm_total){
+            fm_offset+=fm_count;fm_selected=0;
+            (void)fm_refresh();
+        }
+    }else{
+        if(fm_selected>0){fm_selected--;return;}
+        if(fm_offset>0){
+            fm_offset=fm_offset>SD_BROWSER_PAGE_SIZE?fm_offset-SD_BROWSER_PAGE_SIZE:0;
+            fm_selected=(int)SD_BROWSER_PAGE_SIZE-1;
+            (void)fm_refresh();
+        }
+    }
+}
+static void fm_open(void)
+{
+    if(!storage_mounted()){
+        if(!fm_guard())return;
+        sd_ok=storage_init()==ESP_OK;
+        operation_guard_release();
+        if(!storage_mounted()){
+            fm_status(false,"SD NOT MOUNTED",storage_last_error());return;
+        }
+    }
+    fm_copy_mode=false;snprintf(fm_dir,sizeof(fm_dir),"%s",FM_ROOT_DIR);fm_offset=0;fm_selected=0;
+    if(fm_refresh())page=PAGE_FM_FILES;
+}
+static void fm_begin_edit(fm_edit_action_t action)
+{
+    if(action==FM_EDIT_RENAME && !fm_count)return;
+    fm_edit_action=action;
+    snprintf(fm_name_input,sizeof(fm_name_input),"%s",
+             action==FM_EDIT_NEW_FOLDER?"":fm_items[fm_selected].name);
+    fm_name_length=strlen(fm_name_input);fm_name_error=false;
+    page=PAGE_FM_EDIT;
+}
+static void fm_commit_edit(void)
+{
+    if(!fm_guard())return;
+    esp_err_t err=fm_edit_action==FM_EDIT_NEW_FOLDER?
+        sd_browser_mkdir(fm_dir,fm_name_input):
+        sd_browser_rename(fm_dir,fm_items[fm_selected].name,fm_name_input);
+    operation_guard_release();
+    if(err!=ESP_OK){fm_name_error=true;fm_error(err);return;}
+    fm_status(true,fm_edit_action==FM_EDIT_NEW_FOLDER?"FOLDER CREATED":"NAME UPDATED",fm_name_input);
+}
+static void fm_handle_edit(cp_key_event_t e)
+{
+    if(e.type==CP_KEY_CANCEL){page=PAGE_FM_FILES;return;}
+    if(e.type==CP_KEY_BACKSPACE){
+        if(fm_name_length){fm_name_input[--fm_name_length]=0;fm_name_error=false;}
+        else page=PAGE_FM_FILES;
+        return;
+    }
+    if(e.type==CP_KEY_ENTER){fm_commit_edit();return;}
+    if(e.type!=CP_KEY_CHAR||fm_name_length>=SD_BROWSER_NAME_MAX-1)return;
+    unsigned char c=(unsigned char)e.character;
+    if(c<32||c>126||strchr("/\\:*?\"<>|",c))return;
+    fm_name_input[fm_name_length++]=(char)c;
+    fm_name_input[fm_name_length]=0;
+    fm_name_error=false;
+}
+static bool fm_text_ext(const char *name)
+{
+    size_t n=strlen(name);
+    return (n>=4&&(!strcasecmp(name+n-4,".TXT")||!strcasecmp(name+n-4,".LOG")||
+                   !strcasecmp(name+n-4,".CSV"))) ||
+           (n>=3&&!strcasecmp(name+n-3,".MD"));
+}
+static void fm_open_selected_file(void)
+{
+    if(!fm_count)return;
+    const sd_browser_entry_t *v=&fm_items[fm_selected];
+    if(v->directory){if(fm_change_dir(v->name))page=PAGE_FM_FILES;return;}
+    snprintf(fm_target,sizeof(fm_target),"%s",v->name);
+    fm_file_size=v->size;
+    if(fm_text_ext(fm_target)){
+        fm_text_start=0;
+        if(!fm_guard())return;
+        esp_err_t err=sd_browser_text_page(fm_dir,fm_target,0,fm_text_rows,
+                                              &fm_text_total,&fm_text_truncated);
+        operation_guard_release();
+        if(err!=ESP_OK){fm_error(err);return;}
+        page=PAGE_FM_TXT;
+    }else page=PAGE_FM_BIN_INFO;
+}
+static void fm_scroll_txt(int delta)
+{
+    if(!fm_text_total)return;
+    size_t want=fm_text_start;
+    if(delta<0){size_t n=(size_t)(-delta);want=want>n?want-n:0;}
+    else if(delta>0){
+        size_t max=fm_text_total>STORAGE_TEXT_ROWS?fm_text_total-STORAGE_TEXT_ROWS:0;
+        size_t n=(size_t)delta;
+        want=(n>max-want)?max:want+n;
+    }
+    if(want==fm_text_start)return;
+    if(!fm_guard())return;
+    size_t total=0;bool truncated=false;
+    esp_err_t err=sd_browser_text_page(fm_dir,fm_target,want,fm_text_rows,
+                                        &total,&truncated);
+    operation_guard_release();
+    if(err!=ESP_OK){fm_error(err);return;}
+    fm_text_start=want;fm_text_total=total;fm_text_truncated=truncated;
+}
+static void fm_cancel_copy(void)
+{
+    fm_copy_mode=false;
+    snprintf(fm_dir,sizeof(fm_dir),"%s",fm_saved_dir);
+    fm_offset=fm_saved_offset;fm_selected=fm_saved_selection;
+    if(fm_refresh())page=PAGE_FM_FILES;
+}
+static void fm_begin_copy(void)
+{
+    if(!fm_count)return;
+    fm_copy_mode=true;
+    snprintf(fm_copy_source_dir,sizeof(fm_copy_source_dir),"%s",fm_dir);
+    snprintf(fm_copy_source_name,sizeof(fm_copy_source_name),"%s",fm_items[fm_selected].name);
+    snprintf(fm_saved_dir,sizeof(fm_saved_dir),"%s",fm_dir);
+    fm_saved_offset=fm_offset;fm_saved_selection=fm_selected;
+    fm_offset=0;fm_selected=0;
+    if(fm_refresh())page=PAGE_FM_COPY_DEST;
+}
+static void fm_commit_copy(void)
+{
+    if(!fm_copy_mode)return;
+    if(!fm_guard())return;
+    progress_reset();
+    progress_draw("COPY SD ITEM","COPYING / VERIFYING FILES",20,0,0,"DO NOT REMOVE SD CARD");
+    char target[SD_BROWSER_NAME_MAX];
+    esp_err_t err=sd_browser_copy(fm_copy_source_dir,fm_copy_source_name,fm_dir,
+                                   target,sizeof(target));
+    operation_guard_release();
+    if(err!=ESP_OK){fm_error(err);return;}
+    progress_draw("COPY SD ITEM","FILES COPIED",100,0,0,"SOURCE UNCHANGED");
+    fm_status(true,"COPY VERIFIED",target);
+}
+static void fm_begin_delete(void)
+{
+    if(!fm_count)return;
+    snprintf(fm_target,sizeof(fm_target),"%s",fm_items[fm_selected].name);
+    fm_target_dir=fm_items[fm_selected].directory;
+    fm_delete_armed=false;
+    page=PAGE_FM_DELETE;
+}
+static void fm_commit_delete(void)
+{
+    if(!fm_guard())return;
+    progress_reset();
+    progress_draw("DELETE SD ITEM","DELETING SELECTED CONTENT",20,0,0,"PERMANENT OPERATION");
+    esp_err_t err=sd_browser_delete(fm_dir,fm_target);
+    operation_guard_release();
+    if(err!=ESP_OK){fm_error(err);return;}
+    fm_status(true,"ITEM DELETED",fm_target);
+}
+static void fm_notice_continue(void)
+{
+    if(fm_copy_mode){fm_cancel_copy();return;}
+    fm_selected=0;
+    if(fm_refresh())page=PAGE_FM_FILES;
+}
 static void select_menu(void)
 {
     switch(menu_selected){
@@ -1529,7 +2028,9 @@ static void handle_key(cp_key_event_t e)
             else if(e.type==CP_KEY_CHAR&&e.character=='0'){
                 settings_selected=0;page=PAGE_SETTINGS;
             }
+            else if(e.type==CP_KEY_CHAR&&(e.character=='v'||e.character=='V'))start_verify_browser();
             else if(e.type==CP_KEY_CHAR&&(e.character=='h'||e.character=='H'))open_hdd_recovery();
+            else if(e.type==CP_KEY_CHAR&&(e.character=='f'||e.character=='F'))fm_open();
             else if(e.type==CP_KEY_CHAR&&(e.character=='p'||e.character=='P'))page=PAGE_PINS;
             else if(e.type==CP_KEY_CHAR&&(e.character=='b'||e.character=='B'))page=PAGE_BATTERY;
             else if(e.type==CP_KEY_CHAR&&(e.character=='m'||e.character=='M')) {
@@ -1547,7 +2048,8 @@ static void handle_key(cp_key_event_t e)
             if(e.type==CP_KEY_ENTER||back(e))page=PAGE_MENU;
             break;
         case PAGE_INSPECT:
-            if(e.type==CP_KEY_CHAR&&(e.character=='h'||e.character=='H'))open_hdd_recovery();
+            if(e.type==CP_KEY_CHAR&&(e.character=='v'||e.character=='V'))start_verify_browser();
+            else if(e.type==CP_KEY_CHAR&&(e.character=='h'||e.character=='H'))open_hdd_recovery();
             else if(up(e)){inspect_selected--;clamp_selection(&inspect_selected,INSPECT_COUNT);}
             else if(down(e)){inspect_selected++;clamp_selection(&inspect_selected,INSPECT_COUNT);}
             else if(back(e))page=PAGE_MENU;
@@ -1606,13 +2108,21 @@ static void handle_key(cp_key_event_t e)
         case PAGE_FOLDERS:
             if(up(e)){list_selected--;clamp_selection(&list_selected,(int)folder_count);}
             else if(down(e)){list_selected++;clamp_selection(&list_selected,(int)folder_count);}
-            else if(back(e))page=browser_purpose==BROWSER_DONOR_SOURCE?PAGE_DONOR_MODE:PAGE_MENU;
+            else if(back(e)){
+                page=browser_purpose==BROWSER_DONOR_SOURCE?PAGE_DONOR_MODE:
+                     browser_purpose==BROWSER_VERIFY?verify_return_page:PAGE_MENU;
+                browser_purpose=BROWSER_OPEN;
+            }
             else if(e.type==CP_KEY_ENTER)choose_folder();
             break;
         case PAGE_FILES:
             if(up(e)){list_selected--;clamp_selection(&list_selected,(int)file_count);}
             else if(down(e)){list_selected++;clamp_selection(&list_selected,(int)file_count);}
             else if(back(e)){open_folder_browser();}
+            else if(e.type==CP_KEY_CHAR&&(e.character=='v'||e.character=='V') &&
+                    browser_purpose==BROWSER_OPEN && list_selected>=0 &&
+                    list_selected<(int)file_count)
+                verify_selected_file(selected_folder,file_list[list_selected]);
             else if(e.type==CP_KEY_ENTER)choose_file();
             break;
         case PAGE_PINS:
@@ -1689,6 +2199,72 @@ static void handle_key(cp_key_event_t e)
             if(back(e))page=PAGE_SETTINGS;
             else if(e.type==CP_KEY_ENTER)run_diagnostics();
             break;
+        case PAGE_FM_FOLDERS:
+        case PAGE_FM_FILES:
+            if(up(e))fm_move(-1);
+            else if(down(e))fm_move(1);
+            else if(back(e)){
+                if(strcmp(fm_dir,FM_ROOT_DIR)==0)page=PAGE_MENU;
+                else if(fm_parent())page=PAGE_FM_FILES;
+            }
+            else if(e.type==CP_KEY_ENTER)fm_open_selected_file();
+            else if(e.type==CP_KEY_CHAR&&(e.character=='n'||e.character=='N'))
+                fm_begin_edit(FM_EDIT_NEW_FOLDER);
+            else if(e.type==CP_KEY_CHAR&&(e.character=='r'||e.character=='R'))
+                fm_begin_edit(FM_EDIT_RENAME);
+            else if(e.type==CP_KEY_CHAR&&(e.character=='c'||e.character=='C'))fm_begin_copy();
+            else if(e.type==CP_KEY_CHAR&&(e.character=='x'||e.character=='X'))fm_begin_delete();
+            else if(e.type==CP_KEY_CHAR&&(e.character=='h'||e.character=='H'))page=PAGE_FM_HELP;
+            else if(e.type==CP_KEY_CHAR&&(e.character=='v'||e.character=='V') && fm_count){
+                const sd_browser_entry_t *v=&fm_items[fm_selected];
+                size_t n=strlen(v->name);
+                if(!v->directory && v->size==256 && n>=4 &&
+                   !strcasecmp(v->name+n-4,".BIN"))
+                    verify_selected_manager_file(fm_dir,v->name);
+            }
+            break;
+        case PAGE_FM_EDIT:fm_handle_edit(e);break;
+        case PAGE_FM_COPY_DEST:
+            if(up(e))fm_move(-1);
+            else if(down(e))fm_move(1);
+            else if(e.type==CP_KEY_CANCEL)fm_cancel_copy();
+            else if(back(e)){
+                if(strcmp(fm_dir,FM_ROOT_DIR)==0)fm_cancel_copy();
+                else if(fm_parent())page=PAGE_FM_COPY_DEST;
+            }
+            else if(e.type==CP_KEY_ENTER && fm_count && fm_items[fm_selected].directory){
+                if(fm_change_dir(fm_items[fm_selected].name))page=PAGE_FM_COPY_DEST;
+            }
+            else if(e.type==CP_KEY_CHAR&&(e.character=='p'||e.character=='P'))fm_commit_copy();
+            break;
+        case PAGE_FM_DELETE:
+            if(back(e))page=PAGE_FM_FILES;
+            else if(e.type==CP_KEY_CHAR&&(e.character=='y'||e.character=='Y'))fm_delete_armed=true;
+            else if(e.type==CP_KEY_ENTER&&fm_delete_armed)fm_commit_delete();
+            break;
+        case PAGE_FM_TXT:
+            if(back(e))page=PAGE_FM_FILES;
+            else if(up(e))fm_scroll_txt(-1);
+            else if(down(e))fm_scroll_txt(1);
+            else if(left(e))fm_scroll_txt(-(int)STORAGE_TEXT_ROWS);
+            else if(right(e))fm_scroll_txt((int)STORAGE_TEXT_ROWS);
+            break;
+        case PAGE_FM_BIN_INFO:
+            if(back(e)||e.type==CP_KEY_ENTER)page=PAGE_FM_FILES;
+            else if(e.type==CP_KEY_CHAR&&(e.character=='v'||e.character=='V') && fm_file_size==256){
+                const size_t n=strlen(fm_target);
+                if(n>=4 && !strcasecmp(fm_target+n-4,".BIN"))
+                    verify_selected_manager_file(fm_dir,fm_target);
+            }
+            break;
+        case PAGE_FM_NOTICE:
+            if(back(e)||e.type==CP_KEY_ENTER)fm_notice_continue();
+            break;
+        case PAGE_FM_HELP:
+            if(back(e)||e.type==CP_KEY_ENTER||
+               (e.type==CP_KEY_CHAR&&(e.character=='h'||e.character=='H')))
+                page=PAGE_FM_FILES;
+            break;
         case PAGE_CONFIRM_WRITE:
             if(back(e)){
                 prewrite_valid=false;write_armed=false;
@@ -1696,7 +2272,7 @@ static void handle_key(cp_key_event_t e)
                 if(write_guard_held){write_guard_held=false;operation_guard_release();}
                 page=PAGE_MENU;
             }
-            else if(e.type==CP_KEY_CHAR&&(e.character=='w'||e.character=='W'))write_armed=true;
+            else if(e.type==CP_KEY_CHAR&&(e.character=='y'||e.character=='Y'))write_armed=true;
             else if(e.type==CP_KEY_ENTER&&write_armed)do_commit_write();
             break;
     }
