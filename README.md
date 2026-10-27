@@ -9,7 +9,17 @@
 
 M5 Prom is designed for console repair and recovery work. It uses a purpose-built Cardputer-to-LPC adapter to access the original Xbox's 256-byte EEPROM **while the console is powered off**, and stores backups and edited images as ordinary files on a FAT32 microSD card. No running Xbox dashboard, computer connection or network is required for EEPROM operations.
 
-> **Release status:** The current source baseline is **v0.9.3 (pre-release)**. Some hardware validation is still in progress. The [`firmware/`](firmware/) directory may be empty until compiled release images are available. You can build the firmware from [`src/`](src/) in the meantime.
+> **Release status:** The current source baseline is **v0.9.4 (pre-release)**. The standalone utility and Native USB Remote have been exercised on Cardputer hardware; full release validation of EEPROM operations, storage, and recovery workflows is still in progress. The [`firmware/`](firmware/) directory may be empty until a matched compiled release is published. You can build from [`src/`](src/) in the meantime.
+
+### Latest v0.9.4 improvements
+
+- **HDD Recovery:** Press `H` from Home or Inspect, then `M` for the hard drive's ATA model and `S` for its serial. Press `P` to preview the derived ATA USER unlock password or `Enter` to save a numbered FAT32 recovery report. The original HDD-key-only export remains available.
+- **Faster native USB Remote:** Pass 1 repairs FreeRTOS scheduling and adds latency/throughput diagnostics; Pass 2 batches CRC-protected display rows and improves TinyUSB buffering. The companion includes live viewing, keyboard input, SD management, screenshots and MP4 capture.
+- **Boot splash:** The embedded 240×135 artwork now includes an initialization progress bar and status messages, without an artificial minimum splash delay.
+- **Display and storage maintenance:** LCD edge-row initialization, battery voltage reporting, SD verification diagnostics and protected EEPROM backup/write operations are retained.
+
+The firmware version remains **v0.9.4** across these maintenance updates. Remote Pass 2 is the current baseline; no experimental Pass 3 changes are required.
+
 
 ## Features
 
@@ -21,13 +31,15 @@ M5 Prom is designed for console repair and recovery work. It uses a purpose-buil
 - Program a connected EEPROM with prewrite backup, explicit confirmation, progress reporting and full readback verification.
 - View SD filesystem and EEPROM-detection diagnostics, battery information and adapter pinout.
 - Configure brightness, automatic dimming, sounds and Wi-Fi; optionally manage SD files through a local web browser.
+- Press **H** on Home or Inspect to view a validated Xbox HDD key. Enter the **drive model** and **drive serial** to calculate a drive-specific ATA user unlock password; save the recovery information to a versioned `HDDKEY_####.TXT` beside the EEPROM backup.
+- Optional **M5 Prom Remote** USB companion: mirror the real display, record MP4/screenshot PNG, send PC keyboard input and browse files on FAT32.
 
 ## Supported hardware
 
 - **M5Stack Cardputer V1.1** (Stamp-S3A / ESP32-S3, 8 MB flash). The current firmware pin mapping is **not for Cardputer ADV**.
 - **Original Xbox** LPC connection using the M5 Prom adapter PCB, a correctly oriented cable and a compatible EEPROM.
 - FAT32 microSD card for backup, restore and donor files.
-- USB data cable for firmware flashing and serial diagnostics.
+- USB data cable for firmware flashing and optional **M5 Prom Remote**. The running native-USB Remote firmware uses a dedicated USB interface, not a conventional UART/COM port.
 
 **Important:** M5 Prom is an **offline-only programmer**. Power the Xbox **off before connecting or operating the adapter**, and do not use it with a powered-on console. For an offline programming session, use the Cardputer's **5V IN/OUT switch in the OUT position** to power the adapter as designed. Do not confuse that switch with the Cardputer's main power control. Follow the PCB markings and the schematic in [`img/`](img/) for connector orientation; never connect an unregulated 5V line directly to the EEPROM's 3.3V supply.
 
@@ -35,7 +47,7 @@ M5 Prom is designed for console repair and recovery work. It uses a purpose-buil
 
 The adapter's **four-pin Cardputer/Grove connector (CN1)** carries `SCL`, `SDA`, `5V` and `GND` (pins **1–4**, respectively). On the original Xbox LPC side, the design routes **SCL to LPC 13**, **SDA to LPC 14**, **ground to LPC 2/12**, and **regulated 3.3V to LPC 9/15**. Refer to the actual PCB silkscreen and schematic in [`img/`](img/) before connecting a cable; **connector orientation matters**.
 
-The fabrication package (Gerbers, BOM and pick-and-place files) is maintained in [`pcb/`](pcb/). These are manufacturing files, not substitutes for checking the assembled board and cable before use.
+Manufacturing files (Gerbers, BOM and pick-and-place) belong in [`pcb/`](pcb/). These are manufacturing files, not substitutes for checking the assembled board and cable before use.
 
 ## Getting started
 
@@ -45,6 +57,7 @@ The fabrication package (Gerbers, BOM and pick-and-place files) is maintained in
 4. From the home screen press **`0`** for Settings, select **Diagnostics** and press **Enter**. Confirm that the SD test shows **RW VERIFIED** and that the EEPROM is detected at address **`0x54`**.
 5. Return to the home screen. Select **Read** and press **Enter**. M5 Prom performs two EEPROM reads, checks that they match and saves an **`ORIGINAL_####.BIN`** backup to microSD.
 6. Inspect, edit or save the working image as needed. Use **Write** only when you are ready to program the physical chip.
+7. For HDD recovery, press **`H`**, enter the **drive model** (`M`) and **drive serial** (`S`), preview the derived unlock password (`P`), then press **Enter** to save a recovery TXT file to SD. This does **not** unlock a drive by itself.
 
 If an SD test fails, fix it before attempting to write an EEPROM. A verified prewrite SD backup is mandatory for physical programming.
 
@@ -78,6 +91,7 @@ M5 Prom uses a **3 × 3 menu**. Press **`1`–`9`** to highlight a command, then
 | `B` (home) | Show **Battery** information. |
 | `P` (home) | Show adapter **Pinout**. |
 | `M` (home) | Toggle UI sound effects. |
+| `H` (home or Inspect) | Open HDD Recovery (HDD key and optional ATA unlock-password calculation). |
 | `Tab` (Editor) | Change editor field group. Keys `1`–`6` select a group directly. |
 | `Tab` (Wi-Fi password) | Show or hide the typed password. |
 | `W` then `Enter` (Write confirmation) | Arm and begin the confirmed physical EEPROM write. |
@@ -94,6 +108,24 @@ Open **Donor** (`9`) and choose one of the following:
 
 A scratch donor generates a **new HDD key**. It will **not unlock a drive locked using the original EEPROM key**; retain your original backup before replacing an EEPROM.
 
+### HDD key and drive unlock recovery
+
+Open **HDD Recovery** by pressing **`H`** from Home or Inspect after loading or reading a valid EEPROM. The Xbox HDD key is available only if the EEPROM's encrypted security block authenticates successfully.
+
+| Key in HDD Recovery | Action |
+|---|---|
+| `M` | Type the **hard drive's ATA IDENTIFY model** (maximum 40 ASCII characters). |
+| `S` | Type the **hard drive's ATA IDENTIFY serial** (maximum 20 ASCII characters). |
+| `P` | Preview the calculated **32-byte ATA USER password** (only when both fields are valid). |
+| `Enter` | Save the currently available recovery information to a **new** SD text file. |
+| `Backspace` / cancel | Return without saving; the EEPROM working copy is unchanged. |
+
+In either text editor, type normally; **Backspace** erases a character, **Enter** accepts the field and **Fn+`** cancels. The Remote desktop application forwards the same keystrokes when connected. **Both drive fields are required** for ATA password calculation; with neither entered, Enter still exports the Xbox HDD key by itself. An incomplete pair will not generate or save a misleading ATA password. The entered model and serial are **session-only**; opening HDD Recovery again clears them.
+
+The algorithm is **HMAC-SHA1(key = decrypted Xbox HDD key, data = model bytes followed by serial bytes)**. The ATA USER password is its 20-byte digest followed by **12 zero bytes**; the text report includes the full 32-byte password as 64 hexadecimal characters. Only trailing ASCII spaces from the ATA IDENTIFY fields are trimmed: case, internal spaces and leading spaces are significant. **Use actual drive IDENTIFY values**, not the console serial or a shortened marketing name from a label. This simple editor accepts printable ASCII; unusual non-ASCII drive identifiers are not supported for manual entry.
+
+Reports are stored at `/EEPROMs/<console-serial>/HDDKEY_####.TXT` on the mounted FAT32 filesystem, exclusively numbered and verified after saving. This operation **does not write to the Xbox EEPROM or perform any ATA command**; unlocking an attached drive requires a separate compatible utility or adapter. Keep the resulting TXT private because it contains recoverable HDD security secrets. A newly generated donor HDD key will not unlock an existing drive locked with the console's former key.
+
 ### Writing an EEPROM
 
 1. Load, create or edit the intended image, then verify its details.
@@ -103,6 +135,32 @@ A scratch donor generates a **new HDD key**. It will **not unlock a drive locked
 5. Watch the progress indicator. Programming progress tracks EEPROM write acknowledgements, then completes **two full verification reads**. **100% means the entire EEPROM was verified.**
 
 **Never disconnect or power down during a write.** Once physical programming begins there is **no mid-write cancellation**. If interrupted or reported unsuccessful, the EEPROM may be partially programmed; retain the prewrite backup for recovery.
+
+## M5 Prom Remote — USB desktop companion
+
+The optional [**`remote/`**](remote/) companion provides a large live view of the **actual Cardputer 240×135 screen**, keyboard control from the PC, screenshot/MP4 recording and a graphical FAT32 file manager. It works over the Cardputer's built-in **native USB-OTG vendor interface on USB-C**, without Wi-Fi or a separate UART adapter.
+
+For Windows, double-click **`remote/M5Prom-Remote.bat`**. The launcher creates a private Python environment and automatically installs any missing, latest-compatible **PySide6-Essentials, pyusb, libusb-package, numpy, imageio and imageio-ffmpeg** packages—no pinned package versions. Python 3.10+ and internet access for first-run setup are required.
+
+Choose **M5 Prom Native USB** and click **Connect**. Its physical LCD switches to **PC MODE ACTIVE**, while the normal application menus remain fully accessible in the remote window. Click the PC display to give it keyboard focus; Enter, arrows, Esc/Backspace, Tab and ordinary M5 Prom shortcuts all work. After disconnect or lost USB heartbeat, the Cardputer resumes local use automatically.
+
+**Optimized native USB mirroring:** The current Pass 2 firmware batches multiple changed, CRC-protected screen rows per transfer and uses RGB565 compression where supported. Compression is negotiated automatically. The runtime connection uses the native USB vendor interface rather than the former serial/COM protocol; install matching native-USB firmware and desktop app.
+
+**File manager:** View, upload, download, rename and delete files, or create new folders in the existing FAT32 filesystem. Transfers are serialized behind the same protection used by EEPROM reads/writes and the web manager. The PC cannot mount the SD card as raw USB Mass Storage. The device continues to enforce all existing EEPROM write confirmation and backup requirements.
+
+**Privacy:** Recordings and HDD recovery TXT files can contain console identity and key material. Treat them as sensitive before sharing or uploading.
+
+**Windows USB note:** The native device uses WinUSB; if it does not enumerate, check the driver binding and the guidance in [`remote/README.md`](remote/README.md). Keep the ROM BOOT flashing path available. Prototype USB VID/PID values should not be treated as production identifiers.
+
+See [`remote/README.md`](remote/README.md) for a user walkthrough and [`remote/PROTOCOL.md`](remote/PROTOCOL.md) for the optional technical details. Installing this patched firmware does not require installing the PC software; M5 Prom still runs standalone.
+
+**Remote performance diagnostics (Pass 1):** The companion reports USB transfer rates, completed-screen FPS, keyboard acknowledgements, queue drops and available internal RAM. Select **Export Diagnostics CSV** to capture measurements for troubleshooting. The USB task sleeps on USB/display notifications rather than zero-tick polling. See [`PASS1_USB_DIAGNOSTICS.md`](PASS1_USB_DIAGNOSTICS.md) for the test plan.
+
+**Remote throughput (Pass 2):** The firmware groups CRC-protected screen rows into
+larger USB submissions while preserving the v1 stream, and reserves USB TX FIFO
+space for keyboard acknowledgements. The default endpoint transfer buffer is now
+8192 bytes; existing ESP-IDF `sdkconfig` files must be updated separately. No
+changes to the GUI workflow are required. See [`PASS2_USB_TRANSPORT.md`](PASS2_USB_TRANSPORT.md).
 
 ## microSD and files
 
@@ -114,7 +172,8 @@ The card uses its **existing FAT32 filesystem**, mounted internally at `/sdcard`
     ├── ORIGINAL_0001.BIN
     ├── DONOR_0001.BIN
     ├── PREWRITE_0001.BIN
-    └── TO_WRITE_0001.BIN
+    ├── TO_WRITE_0001.BIN
+    └── HDDKEY_0001.TXT        # Xbox HDD key; optional drive-specific ATA password
 ```
 
 File names and sequence numbers vary by operation. M5 Prom also supports a fallback folder name when the serial number is invalid. Each EEPROM image is **exactly 256 bytes**, with a new version created instead of overwriting an existing file. Treat backups as sensitive: they contain console-specific identity and security material.
@@ -127,6 +186,7 @@ Press **`0`** on the home screen to access:
 
 - **Brightness:** 10–100%; **Auto Dim:** Off, 30 s, 1 min, 2 min or 5 min.
 - **Sound Effects:** On/Off.
+- **Battery:** View approximate voltage-based charge level and trend. Cardputer v1.1 does not provide a charging-current sensor; current (mA) cannot be read.
 - **Wi-Fi Mode:** Off, Auto, Station or SoftAP. Auto attempts saved Station Wi-Fi first and falls back to SoftAP if unavailable.
 - **Join Network:** Scan nearby **2.4 GHz** Wi-Fi networks and enter credentials.
 - **Web Files:** On/Off (**off by default**).
@@ -137,28 +197,37 @@ The device's SoftAP network is named **`M5Prom-XXXX`** (device-specific suffix) 
 
 The browser interface is **intended only for a trusted private network**. It uses HTTP without a separate web login. Do not port-forward it or expose it to the internet, and switch **Web Files OFF** when not needed. During protected EEPROM/SD operations, conflicting web file requests are temporarily rejected rather than allowed to interrupt a backup.
 
-## Flashing M5 Prom (GUI)
+## Flashing a precompiled release
 
-The included **PySide6 flasher** is designed for technicians and end users. You do **not** need ESP-IDF, a command line, or a particular folder structure to install compiled firmware.
+Compiled releases, once published, belong in [`firmware/`](firmware/). A complete install uses **three matching binaries from the same build**:
 
-1. Connect the Cardputer to the PC with a USB-C **data** cable, with the Xbox adapter disconnected.
-2. On Windows, double-click **`M5Prom-Flasher.bat`** in the repository root. The first launch automatically sets up a private Python environment and downloads the needed GUI and flashing packages. Internet is required only for initial setup.
-3. Select the Cardputer's **USB port** (or click **Refresh**).
-4. Use the three **Browse** buttons to select the correct `.bin` files, wherever they are saved:
-   - **Bootloader** — `bootloader.bin`
-   - **Partitions** — `partitions.bin` or `partition-table.bin`
-   - **Firmware** — the compiled M5 Prom application, typically `cardputer_xbox_eeprom.bin`
-5. Click **Flash**. Follow the progress and wait for the **Success** message before unplugging the Cardputer.
+```text
+firmware/
+├── bootloader.bin
+├── partitions.bin                 # or partition-table.bin
+└── cardputer_xbox_eeprom.bin      # application name may vary
+```
 
-The names above are examples, **not required filenames**. Each image can be selected from a different directory. There is no folder scanning, copying, renaming, or configuration file to prepare. **Use all three binaries from the same compiled release.**
+For Windows, the supported user-facing method is the simple **PySide6 GUI flasher** in [`tools/`](tools/):
 
-**Initial setup:** The Windows launcher needs **Python 3.10+** on the PC. It will open the official Python download page if Python isn't present; Python packages such as PySide6 and esptool are installed automatically. Subsequent launches work offline. A future self-contained `.exe` could remove even the initial Python requirement. macOS/Linux users with Python 3.10+ can start the same GUI using `python3 tools/flash.py`.
+1. Double-click **`tools/M5Prom-Flasher.bat`**. On first launch it installs missing Python dependencies automatically.
+2. Select the Cardputer's USB COM port.
+3. Click **Browse** to select your **bootloader**, **partition table**, and **application firmware** `.bin` files. They can be located anywhere on your PC and do not need special filenames.
+4. Click **Flash** and follow the progress indicator. Do not disconnect during programming.
 
-### Connection help
+The launcher requires Python 3.10+. Flashing is separate from **M5 Prom Remote**. Close Remote and enter ROM BOOT download mode (hold BOOT/G0 while resetting) before using the flasher; normal M5 Prom runtime uses native vendor USB, not a COM port.
 
-If the port is missing or flashing cannot connect, close any serial monitor and try a different USB data cable. To enter download mode on the Cardputer, with the Xbox adapter disconnected, set its power switch **OFF**, hold **G0**, connect USB-C to the PC, then release **G0** and press **Refresh**. The app also includes a **Connection help** link.
+**v0.9.4 flash offsets (ESP32-S3):**
 
-The flasher writes the bootloader at `0x00000`, partition table at `0x08000`, and application at `0x10000` (ESP32-S3 factory layout). It validates each selected file, checks that the application fits the selected partition table, and uses esptool for verified flashing. It **does not mass-erase the ESP32-S3** and it does not modify the microSD card. If the firmware release isn't yet compiled, the `/firmware` directory may be empty.
+| Image | Offset |
+|---|---|
+| Bootloader | `0x00000` |
+| Partition table | `0x08000` |
+| Factory application | `0x10000` |
+
+These offsets correspond to the `/src/partitions.csv` layout (8 MB flash with a 3 MB factory-app partition). **Do not mix files from different firmware builds or use these offsets if you have changed the partition layout.** The script does not mass-erase the flash, so NVS settings outside the flashed image ranges are normally retained. If the computer cannot connect, check the USB data cable, port selection and Cardputer download/bootloader mode.
+
+> **Precompiled images are not required to browse or build the source.** The `/firmware` folder may remain incomplete until binaries for a release have been published.
 
 ## Build from source
 
@@ -177,6 +246,8 @@ idf.py -p COM7 flash monitor
 
 In `menuconfig`, ensure **Component config → FAT Filesystem support → Long filename support** is enabled (prefer **Long filename buffer in heap**). This is needed for serial-number directories and filenames such as `ORIGINAL_0001.BIN`. `sdkconfig.defaults` supplies intended settings for a fresh build, but an existing `sdkconfig` can override them.
 
+For the native-USB Remote build, check **Component config → TinyUSB Stack** for one vendor interface, an **8192-byte TX FIFO**, a **4096-byte RX FIFO**, and an **8192-byte vendor endpoint buffer**. The USB vendor endpoint is still Full Speed; that buffer is an internal transfer buffer, not a USB packet-size setting. The active `sdkconfig` controls the build, even if `sdkconfig.defaults` contains different values.
+
 When preparing a precompiled firmware release, copy these three outputs from `src/build/` into `/firmware`:
 
 | Build output | Release file |
@@ -192,20 +263,28 @@ Only publish these as a matched set from a successful build. If you have changed
 ```text
 M5-Prom/
 ├── README.md                 # This guide
-├── M5Prom-Flasher.bat        # Double-click to start Windows GUI flasher
-├── img/                      # logo.png, darkone83.png, PCB renders, schematic
+├── img/                      # logo.png, Darkone83.png, PCB renders, schematic
 ├── pcb/                      # Gerbers, BOM, pick-and-place manufacturing data
 ├── src/                      # Complete ESP-IDF application project
 │   ├── CMakeLists.txt
 │   ├── main/
 │   ├── partitions.csv
 │   └── sdkconfig.defaults
-├── firmware/                 # Compiled releases when available
-└── tools/
-    ├── flash.py             # First-run dependency installer and GUI launcher
-    ├── flasher_gui.py       # PySide6 graphical flasher
-    ├── flasher_core.py      # Validation for three user-selected files and flash commands
-    └── test_flasher.py      # Host-side tests
+├── firmware/                 # Optional compiled matched binary sets
+├── tools/                    # Existing PySide6 firmware flasher
+│   ├── M5Prom-Flasher.bat
+│   ├── flash.py
+│   ├── flasher_gui.py
+│   └── flasher_core.py
+└── remote/                   # USB desktop companion
+    ├── M5Prom-Remote.bat      # Double-click Windows launcher
+    ├── bootstrap.py          # Installs missing current dependencies
+    ├── remote_app.py         # PySide6 display / recorder / SD UI
+    ├── worker.py             # Native USB and file-transfer worker
+    ├── video_recorder.py     # Nonblocking background MP4 encoding
+    ├── protocol.py           # Framing, CRC and protocol constants
+    ├── README.md
+    └── PROTOCOL.md
 ```
 
 ## Troubleshooting
@@ -216,9 +295,11 @@ M5-Prom/
 | EEPROM not detected | Console powered off, adapter orientation/connections and **Diagnostics** (`0x54`). |
 | Read fails | Stable adapter connection; the two physical reads must match. A failed read does not create a new original image. |
 | Write refuses to start | A valid working image and a writable microSD are required, along with successful **PREWRITE** and **TO_WRITE** backups. |
+| HDD ATA password unavailable | Load an EEPROM with a valid authenticated security block; enter **both** the drive model (`M`) and drive serial (`S`) exactly as ATA IDENTIFY reports them. A console serial is not the HDD serial. |
 | Wi-Fi browser unavailable | Check Wi-Fi mode and IP under **Network Info**, enable **Web Files**, and use a private local connection. |
-| GUI flasher reports missing files | Click Browse beside each of the three file types and choose the correct `.bin` from any folder. |
-| USB flash connection fails | Choose the correct port, close other serial monitors, try a data-capable cable or enter Cardputer Download Mode (hold G0 while connecting USB). Choose Compatibility speed if necessary. |
+| Flasher reports missing files | Select the three matching ESP-IDF `.bin` files with the GUI Browse buttons. |
+| USB flash connection fails | Enter the Cardputer ROM BOOT download mode, choose its COM port in the flasher, and use a data-capable cable. The app-running native USB interface is not a flasher COM port. |
+| Remote app will not connect | Flash the matching native-USB firmware, reconnect the cable, check WinUSB device enumeration and click Refresh Devices; the normal COM port does not appear in PC Mode. |
 
 ## Credits and licensing
 

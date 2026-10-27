@@ -27,4 +27,8 @@ void display_frame(int x, int y, int w, int h, uint32_t rgb);
 void display_text(int x, int y, const char *text, uint32_t rgb, int scale);
 /* Copies the flash-resident M5 Prom RGB565 splash into the existing framebuffer. */
 void display_show_splash(void);
+/* Updates only the lower splash status strip (actual boot milestones).
+ * 0..100, with short status label. Does not require SD or USB.
+ */
+void display_splash_progress(uint8_t percent, const char *status);
 void display_present(void);

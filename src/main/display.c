@@ -1,8 +1,10 @@
 #include "display.h"
 #include "splash_asset.h"
+#include "remote_usb.h"
 #include "board.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -22,6 +24,33 @@ static SemaphoreHandle_t s_tx_done;
 static uint16_t fb[CP_LCD_WIDTH * CP_LCD_HEIGHT];
 #define STRIP_ROWS 10
 static uint16_t *s_transfer;
+static bool s_pc_mode_presented;
+static uint16_t wire565(uint32_t rgb);
+/* The ST7789 controller RAM is taller than the 240x135 visible area.
+ * Some panel assemblies expose an extra scanline at the lower glass edge.
+ * This row is not part of the logical framebuffer and used to retain random
+ * GRAM contents between boots, visible on every UI page. Blank it once.
+ * Leave the proven Cardputer v1.1 40,52 geometry unchanged.
+ */
+static void clear_panel_bottom_guard(void)
+{
+    if (!panel || !s_transfer || !s_tx_done) return;
+    enum { GUARD_ROWS = 2 };
+    const uint16_t clear_color = wire565(UI_BG);
+    for (int i = 0; i < CP_LCD_WIDTH * GUARD_ROWS; ++i)
+        s_transfer[i] = clear_color;
+    esp_err_t err = esp_lcd_panel_draw_bitmap(panel,
+                                               0, CP_LCD_HEIGHT,
+                                               CP_LCD_WIDTH,
+                                               CP_LCD_HEIGHT + GUARD_ROWS,
+                                               s_transfer);
+    if (err == ESP_OK) {
+        if (xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(1000)) != pdTRUE)
+            ESP_LOGW(TAG, "Panel bottom guard DMA timeout");
+    } else {
+        ESP_LOGW(TAG, "Panel bottom guard unavailable: %s", esp_err_to_name(err));
+    }
+}
 
 static bool on_color_done(esp_lcd_panel_io_handle_t io,
                           esp_lcd_panel_io_event_data_t *evt, void *ctx)
@@ -106,6 +135,7 @@ esp_err_t display_init(void)
     else ESP_LOGW(TAG,"PWM backlight unavailable; staying at full brightness");
     display_clear(UI_BG);
     display_present();
+    clear_panel_bottom_guard();
     ESP_LOGI(TAG, "LCD initialized, 240x135 landscape (V1.1)");
     return ESP_OK;
 }
@@ -129,6 +159,61 @@ void display_show_splash(void)
     _Static_assert(sizeof(fb) == sizeof(m5prom_splash_pixels), "splash mismatch");
     memcpy(fb, m5prom_splash_pixels, sizeof(fb));
     display_present();
+}
+
+/* The M5 Prom splash artwork stays untouched above this footer. Partial LCD
+ * DMA draws keep boot updates cheap, even before SD/Wi-Fi/USB are ready.
+ * The footer intentionally covers the old splash's small edition caption.
+ */
+#define SPLASH_FOOTER_Y 111
+#define SPLASH_BAR_X 8
+#define SPLASH_BAR_Y 124
+#define SPLASH_BAR_W 224
+#define SPLASH_BAR_H 7
+
+void display_splash_progress(uint8_t percent, const char *status)
+{
+    if (percent > 100) percent = 100;
+    if (!status) status = "INITIALIZING";
+
+    display_rect(0, SPLASH_FOOTER_Y, CP_LCD_WIDTH,
+                 CP_LCD_HEIGHT - SPLASH_FOOTER_Y, UI_BG);
+    /* The 5x7 font uses six pixels/character. Leave 28px for percentage. */
+    char label[30];
+    size_t n = 0;
+    while (status[n] && n < 27) { label[n] = status[n]; ++n; }
+    label[n] = '\0';
+    display_text(8, 114, label, UI_MUTED, 1);
+    char pct[5];
+    snprintf(pct, sizeof(pct), "%u%%", (unsigned)percent);
+    display_text(CP_LCD_WIDTH - 8 - (int)strlen(pct) * 6, 114, pct, UI_WHITE, 1);
+
+    display_rect(SPLASH_BAR_X, SPLASH_BAR_Y, SPLASH_BAR_W, SPLASH_BAR_H, UI_LINE);
+    display_rect(SPLASH_BAR_X + 1, SPLASH_BAR_Y + 1,
+                 SPLASH_BAR_W - 2, SPLASH_BAR_H - 2, UI_HEADER);
+    const int fill = ((SPLASH_BAR_W - 2) * (int)percent + 50) / 100;
+    if (fill > 0)
+        display_rect(SPLASH_BAR_X + 1, SPLASH_BAR_Y + 1,
+                     fill, SPLASH_BAR_H - 2,
+                     percent == 100 ? UI_GOOD : UI_CYAN);
+
+    if (!panel || !s_transfer) return;
+    for (int y = SPLASH_FOOTER_Y; y < CP_LCD_HEIGHT; y += STRIP_ROWS) {
+        const int rows = (CP_LCD_HEIGHT - y < STRIP_ROWS)
+                            ? CP_LCD_HEIGHT - y : STRIP_ROWS;
+        memcpy(s_transfer, &fb[y * CP_LCD_WIDTH],
+               (size_t)rows * CP_LCD_WIDTH * sizeof(uint16_t));
+        esp_err_t err = esp_lcd_panel_draw_bitmap(panel, 0, y, CP_LCD_WIDTH,
+                                                  y + rows, s_transfer);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Splash footer update failed: %s", esp_err_to_name(err));
+            break;
+        }
+        if (xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            ESP_LOGW(TAG, "Splash footer DMA timed out");
+            break;
+        }
+    }
 }
 
 void display_clear(uint32_t rgb)
@@ -226,6 +311,23 @@ void display_text(int x, int y, const char *text, uint32_t rgb, int scale)
 void display_present(void)
 {
     if (!panel || !s_transfer) return;
+    if(remote_usb_active()){
+        /* Publish the freshly drawn UI to USB on every update. The physical
+           PC MODE card is unchanged, so draw it only once per connection;
+           repeated SPI/DMA LCD transfers would slow remote keyboard input. */
+        remote_usb_publish(fb);
+        if(s_pc_mode_presented)return;
+        s_pc_mode_presented=true;
+        display_clear(UI_BG);
+        display_rect(0,0,CP_LCD_WIDTH,3,UI_ACCENT);
+        display_frame(8,11,224,112,UI_LINE);
+        display_text(55,24,"M5 PROM",UI_WHITE,2);
+        display_text(52,59,"PC MODE ACTIVE",UI_GOOD,1);
+        display_text(46,78,"USB REMOTE CONNECTED",UI_CYAN,1);
+        display_text(36,99,"CONTROL FROM THE PC",UI_MUTED,1);
+    } else {
+        s_pc_mode_presented=false;
+    }
     for (int y=0; y<CP_LCD_HEIGHT; y+=STRIP_ROWS) {
         int nrows = (CP_LCD_HEIGHT - y < STRIP_ROWS) ? CP_LCD_HEIGHT - y : STRIP_ROWS;
         memcpy(s_transfer, &fb[y * CP_LCD_WIDTH], nrows * CP_LCD_WIDTH * sizeof(uint16_t));

@@ -1,31 +1,18 @@
 #include "battery_model.h"
 #include <string.h>
 
-/* Rough relaxed-voltage SoC table for a 1S Li-ion/LiPo battery. Cannot
- * compensate for load, cell age, charge state or temperature. Do not use
- * this number for hard safety cutoffs or to determine external power status.
+/* Match M5Stack's M5Unified Power_Class::getBatteryLevel() conversion for
+ * the Cardputer family: 3300mV = 0%, 4100mV = 100%, clamped.
+ * This is NOT a fuel gauge; the measured battery voltage under load/USB power
+ * is not a reliable measurement of remaining capacity or charging state.
+ * We smooth the measured voltage below, rather than inventing a different
+ * chemistry curve and disagreeing with M5Stack's own battery example.
  */
-typedef struct {int mv,percent;} soc_point_t;
-static const soc_point_t curve[] = {
-    {3300,0},{3400,5},{3500,10},{3600,19},
-    {3700,33},{3750,43},{3800,53},{3850,63},
-    {3900,73},{4000,85},{4100,95},{4200,100}
-};
-
 int battery_estimate_percent(int mv)
 {
-    const unsigned count=(unsigned)(sizeof(curve)/sizeof(curve[0]));
-    if(mv<=curve[0].mv)return 0;
-    if(mv>=curve[count-1].mv)return 100;
-    for(unsigned i=1;i<count;i++) {
-        if(mv<=curve[i].mv) {
-            const int delta=mv-curve[i-1].mv;
-            const int range=curve[i].mv-curve[i-1].mv;
-            return curve[i-1].percent +
-                   (delta*(curve[i].percent-curve[i-1].percent) + range/2)/range;
-        }
-    }
-    return 100;
+    if(mv<=3300)return 0;
+    if(mv>=4100)return 100;
+    return (mv-3300)*100/800;
 }
 
 void battery_model_init(battery_model_t *model)
@@ -64,7 +51,23 @@ bool battery_model_sample(battery_model_t *model,int voltage_mv,uint32_t now_ms)
     }
     model->status.valid=true;
     model->status.millivolts=model->filtered_mv;
-    model->status.percentage=battery_estimate_percent(model->filtered_mv);
+    int percent=battery_estimate_percent(model->filtered_mv);
+    if(!old.valid){
+        model->status.percentage=percent;
+    }else{
+        /* Four-millivolt hysteresis on the nominal 8mV-per-point scale
+         * prevents a battery sitting on a threshold from jumping between
+         * adjacent percentage values. Large genuine changes still propagate.
+         */
+        const int previous=old.percentage;
+        if(percent>previous){
+            const int threshold=3300+(previous+1)*8+4;
+            if(model->filtered_mv>=threshold)model->status.percentage=percent;
+        }else if(percent<previous){
+            const int threshold=3300+previous*8-4;
+            if(model->filtered_mv<=threshold)model->status.percentage=percent;
+        }
+    }
     // A full ~60s observation window and 30mV hysteresis prevent ADC noise
     // from being interpreted as a voltage trend; this is NOT charger detection.
     if(model->trend_initialized &&

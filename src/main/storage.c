@@ -374,3 +374,72 @@ size_t storage_scan_folders(char names[][STORAGE_NAME_SIZE],size_t maximum)
 {return scan(NULL,true,names,maximum);}
 size_t storage_scan_files(const char *folder,char names[][STORAGE_NAME_SIZE],size_t maximum)
 {return scan(folder,false,names,maximum);}
+
+/* Plain-text HDD key export through the mounted FAT VFS only. Reports are
+ * deliberately versioned: no prior TXT or EEPROM backup is overwritten.
+ * The caller holds operation_guard, so web uploads cannot race this write.
+ */
+esp_err_t storage_save_hdd_report(const char *folder,const char *report,size_t report_len,
+                                  char *name,size_t name_len)
+{
+    if(name&&name_len)name[0]=0;
+    if(!ready||!folder||!report||!name)return ESP_ERR_INVALID_STATE;
+    if(name_len<STORAGE_NAME_SIZE)return ESP_ERR_INVALID_ARG;
+    if(report_len==0||report_len>1024||strlen(report)!=report_len)return ESP_ERR_INVALID_ARG;
+    esp_err_t e=ensure_folder(folder);
+    if(e!=ESP_OK)return e;
+    for(unsigned id=1;id<=9999;id++){
+        char filename[STORAGE_NAME_SIZE],path[160];
+        snprintf(filename,sizeof(filename),"HDDKEY_%04u.TXT",id);
+        snprintf(path,sizeof(path),"%s/%s/%s",ROOT,folder,filename);
+        int fd=open(path,O_WRONLY|O_CREAT|O_EXCL,0644);
+        if(fd<0){
+            if(errno==EEXIST)continue;
+            return report_error("HDD TXT CREATE",errno);
+        }
+        bool success=true;
+        int saved_errno=0;
+        size_t done=0;
+        while(done<report_len){
+            ssize_t n=write(fd,report+done,report_len-done);
+            if(n<=0){success=false;saved_errno=n<0?errno:ENOSPC;break;}
+            done+=(size_t)n;
+        }
+        if(success&&fsync(fd)!=0){success=false;saved_errno=errno;}
+        if(close(fd)!=0){success=false;saved_errno=errno;}
+        if(!success){
+            (void)unlink(path);
+            return report_error("HDD TXT WRITE",saved_errno?saved_errno:EIO);
+        }
+        FILE *f=fopen(path,"rb");
+        if(!f){
+            saved_errno=errno;
+            (void)unlink(path);
+            return report_error("HDD TXT READBACK",saved_errno);
+        }
+        unsigned char buf[128];
+        size_t checked=0;
+        while(checked<report_len){
+            const size_t remaining=report_len-checked;
+            const size_t chunk=remaining<sizeof(buf)?remaining:sizeof(buf);
+            const size_t got=fread(buf,1,chunk,f);
+            if(got!=chunk||memcmp(buf,report+checked,chunk)!=0){success=false;break;}
+            checked+=chunk;
+        }
+        if(success&&fgetc(f)!=EOF)success=false;
+        if(fclose(f)!=0)success=false;
+        memset(buf,0,sizeof(buf));
+        if(!success){
+            (void)unlink(path);
+            return report_error("HDD TXT VERIFY",EIO);
+        }
+        snprintf(name,name_len,"%s",filename);
+        report_ok("HDD TXT VERIFIED");
+        ESP_LOGI(TAG,"Saved and verified HDD recovery TXT (%u bytes)", (unsigned)report_len);
+        return ESP_OK;
+    }
+    snprintf(last_stage,sizeof(last_stage),"HDD TXT CREATE");
+    snprintf(last_error,sizeof(last_error),"HDD TXT NUMBERS EXHAUSTED");
+    snprintf(last_hint,sizeof(last_hint),"REMOVE OLD HDDKEY FILES");
+    return ESP_ERR_NO_MEM;
+}

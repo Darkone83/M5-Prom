@@ -141,3 +141,46 @@ void image_crypto_encrypt(uint8_t buffer[256],int version)
     rc4_crypt(&rc4,buffer+0x1C,20);
     memset(key,0,sizeof(key));memset(&rc4,0,sizeof(rc4));
 }
+
+/* Xbox ATA USER password derives from an ordinary RFC 2104 HMAC-SHA1.
+ * This is deliberately separate from xbox_hmac(), which uses Xbox revision
+ * specific SHA1 IVs for EEPROM encryption/authentication.
+ */
+void image_crypto_hmac_sha1_two(const uint8_t *key,size_t key_len,
+                                const uint8_t *part1,size_t len1,
+                                const uint8_t *part2,size_t len2,
+                                uint8_t digest[20])
+{
+    if(!digest)return;
+    if(!key||(len1&&!part1)||(len2&&!part2)){
+        memset(digest,0,20);return;
+    }
+    static const uint32_t sha1_iv[5]={
+        0x67452301u,0xEFCDAB89u,0x98BADCFEu,0x10325476u,0xC3D2E1F0u
+    };
+    uint8_t key_block[64]={0},pad[64],inner[20];
+    sha_t hash={0};
+    if(key_len>sizeof(key_block)){
+        memcpy(hash.h,sha1_iv,sizeof(hash.h));
+        sha_update(&hash,key,(unsigned)key_len);
+        sha_final(&hash,key_block);
+        key_len=20;
+        memset(&hash,0,sizeof(hash));
+    }else memcpy(key_block,key,key_len);
+    for(size_t i=0;i<sizeof(pad);i++)pad[i]=(uint8_t)(key_block[i]^0x36u);
+    memcpy(hash.h,sha1_iv,sizeof(hash.h));
+    sha_update(&hash,pad,sizeof(pad));
+    sha_update(&hash,part1,(unsigned)len1);
+    sha_update(&hash,part2,(unsigned)len2);
+    sha_final(&hash,inner);
+    memset(&hash,0,sizeof(hash));
+    for(size_t i=0;i<sizeof(pad);i++)pad[i]=(uint8_t)(key_block[i]^0x5cu);
+    memcpy(hash.h,sha1_iv,sizeof(hash.h));
+    sha_update(&hash,pad,sizeof(pad));
+    sha_update(&hash,inner,sizeof(inner));
+    sha_final(&hash,digest);
+    memset(&hash,0,sizeof(hash));
+    memset(key_block,0,sizeof(key_block));
+    memset(pad,0,sizeof(pad));
+    memset(inner,0,sizeof(inner));
+}

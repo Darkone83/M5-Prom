@@ -31,3 +31,10 @@ esp_err_t storage_save_version(const char *folder,const char *tag,const uint8_t 
 esp_err_t storage_load_version(const char *folder,const char *name,uint8_t raw[256]);
 size_t storage_scan_folders(char names[][STORAGE_NAME_SIZE],size_t maximum);
 size_t storage_scan_files(const char *folder,char names[][STORAGE_NAME_SIZE],size_t maximum);
+
+/* Verified, exclusive plain-text export to /EEPROMs/<serial>/HDDKEY_####.TXT.
+ * No raw-sector access, overwrites, or writes to the Xbox EEPROM.
+ * The caller holds operation_guard and supplies an authenticated report.
+ */
+esp_err_t storage_save_hdd_report(const char *folder, const char *report, size_t report_len,
+                                  char *name, size_t name_len);

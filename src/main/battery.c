@@ -16,6 +16,22 @@ static adc_cali_handle_t calibration=NULL;
 static bool ready=false;
 static battery_model_t estimator;
 static bool model_initialized=false;
+static unsigned consecutive_failed_ticks=0;
+
+/* Do not keep displaying a stale percentage indefinitely if USB-only power,
+ * ADC read errors or the battery sense circuit become unavailable. A single
+ * noisy burst should not blank the status, so require three failed polls.
+ */
+static bool battery_sample_failed(void)
+{
+    if(consecutive_failed_ticks<3u)consecutive_failed_ticks++;
+    if(consecutive_failed_ticks<3u)return false;
+    if(!estimator.status.valid)return false;
+    battery_model_init(&estimator);
+    ESP_LOGW(TAG,"No valid battery samples for 3 polls; display unavailable");
+    return true;
+}
+
 
 esp_err_t battery_init(void)
 {
@@ -42,6 +58,7 @@ esp_err_t battery_init(void)
     // if factory calibration is unavailable; show battery as unavailable.
     const adc_cali_curve_fitting_config_t cal_cfg={
         .unit_id=ADC_UNIT_1,
+        .chan=ADC_CHANNEL_9,
         .atten=ADC_ATTEN_DB_12,
         .bitwidth=ADC_BITWIDTH_12
     };
@@ -51,6 +68,7 @@ esp_err_t battery_init(void)
         goto fail;
     }
     ready=true;
+    consecutive_failed_ticks=0;
     ESP_LOGI(TAG,"GPIO%d / ADC1 CH9 calibrated 2:1 battery voltage sense",CP_BAT_ADC_GPIO);
     return ESP_OK;
 fail:
@@ -92,7 +110,8 @@ bool battery_tick(uint32_t now_ms)
         if(vbatt_mv>=2500&&vbatt_mv<=4500)
             voltage_samples[good++]=vbatt_mv;
     }
-    if(good<4)return false;
+    if(good<4)return battery_sample_failed();
+    consecutive_failed_ticks=0;
     // Sort and take median to reject sporadic SPI/audio/charger noise spikes.
     for(unsigned i=1;i<good;i++){
         int n=voltage_samples[i];unsigned j=i;

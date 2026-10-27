@@ -1,5 +1,5 @@
 /*
- * M5 Prom v0.9.3 — Xbox EEPROM Suite
+ * M5 Prom v0.9.4 — Xbox EEPROM Suite
  * Read physical EEPROM -> preserve original on SD -> work on an offline copy.
  * Write only after EEPROM detection, repeated reads, verified SD backup,
  * explicit confirmation, then byte-write/verify. Supports donor generation.
@@ -14,10 +14,12 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "display.h"
+#include "boot_progress.h"
 #include "keyboard.h"
 #include "eeprom.h"
 #include "storage.h"
 #include "image.h"
+#include "hdd_recovery.h"
 #include "donor.h"
 #include "sound.h"
 #include "battery.h"
@@ -25,6 +27,8 @@
 #include "wifi_manager.h"
 #include "web_files.h"
 #include "operation_guard.h"
+#include "remote_usb.h"
+#include "remote_protocol.h"
 #include "esp_random.h"
 #include "bootloader_random.h"
 
@@ -33,7 +37,8 @@ typedef enum {
     PAGE_MENU=0,PAGE_RESULT,PAGE_INSPECT,PAGE_EDIT,PAGE_REPAIR,
     PAGE_TEXT_EDIT,PAGE_CONFIRM_FIX,PAGE_CONFIRM_DISCARD,
     PAGE_FOLDERS,PAGE_FILES,PAGE_PINS,PAGE_DONOR_MODE,PAGE_DONOR,PAGE_CONFIRM_WRITE,PAGE_BATTERY,
-    PAGE_SETTINGS,PAGE_WIFI_SCAN,PAGE_WIFI_PASSWORD,PAGE_WIFI_STATUS,PAGE_DIAGNOSTICS
+    PAGE_SETTINGS,PAGE_WIFI_SCAN,PAGE_WIFI_PASSWORD,PAGE_WIFI_STATUS,PAGE_DIAGNOSTICS,
+    PAGE_HDD_RECOVERY,PAGE_HDD_FIELD_EDIT,PAGE_HDD_ATA_PASSWORD
 } page_t;
 typedef enum {PENDING_NONE=0,PENDING_READ,PENDING_LOAD,PENDING_DONOR} pending_t;
 typedef enum {BROWSER_OPEN=0,BROWSER_DONOR_SOURCE} browser_purpose_t;
@@ -75,6 +80,15 @@ static bool write_security_changes=false;
 static bool write_revision_mismatch=false;
 static char write_target_folder[STORAGE_NAME_SIZE];
 static char write_backup_name[STORAGE_NAME_SIZE];
+static page_t recovery_return_page=PAGE_MENU;
+static char recovered_hdd_key[HDD_RECOVERY_KEY_HEX_SIZE];
+static char hdd_drive_model[HDD_DRIVE_MODEL_MAX+1];
+static char hdd_drive_serial[HDD_DRIVE_SERIAL_MAX+1];
+static char hdd_edit_text[HDD_DRIVE_MODEL_MAX+1];
+static char hdd_ata_password[HDD_ATA_PASSWORD_HEX_SIZE];
+static size_t hdd_edit_len=0;
+static bool hdd_edit_model=true,hdd_entry_error=false;
+
 
 #define WIDTH 240
 #define LIST_FIRST_Y 46
@@ -128,6 +142,12 @@ static void icon8(int x,int y,int which,uint32_t color,int scale)
 static void fit_text(int x,int y,const char *text,int max_chars,uint32_t color,int scale)
 {
     if(!text||max_chars<=0)return;
+    // Hard clip every label to its display region. The font advances 6 pixels
+    // per character at 1x (12 pixels at 2x); avoid depending on LCD clipping.
+    if(x<0||x>=WIDTH||scale<1)return;
+    const int available=(WIDTH-x)/(6*scale);
+    if(available<=0)return;
+    if(max_chars>available)max_chars=available;
     if(max_chars>45)max_chars=45;
     char tmp[48];
     size_t n=strlen(text);
@@ -189,10 +209,8 @@ static void battery_badge(void)
     char pct[5];
     battery_percent_text(b,pct);
     display_text(194,y+1,pct,color,1);
-    const char *trend=b.trend==BATTERY_TREND_RISING?"+":
-                      b.trend==BATTERY_TREND_FALLING?"-":
-                      b.trend==BATTERY_TREND_STABLE?"=":"?";
-    display_text(225,y+1,trend,b.trend==BATTERY_TREND_UNKNOWN?UI_MUTED:UI_CYAN,1);
+    // Percentage only in the global badge: +/- voltage trends can be mistaken
+    // for charger state, which Cardputer hardware cannot report.
 }
 static const char *battery_trend_name(battery_trend_t t)
 {
@@ -229,7 +247,10 @@ static void footer(const char *help)
 }
 static void footer_indexed(const char *help,int selected,int count)
 {
-    footer(help);
+    // Leave an exclusive 38px slot for NN/NN; never draw the help under it.
+    display_rect(0,119,WIDTH,16,UI_HEADER);
+    display_rect(0,119,WIDTH,1,UI_LINE);
+    fit_text(8,124,help,30,UI_MUTED,1);
     if(count>0){
         // Page indicator is always two decimal digits: source lists max at 40.
         int here=selected+1;
@@ -394,17 +415,20 @@ static void render_menu(void)
     icon8(8,7,0,UI_ACCENT,2);
     display_text(31,7,"M5 PROM",UI_WHITE,2);
     display_text(31,21,"XBOX EEPROM SUITE",UI_ACCENT,1);
-    display_text(142,8,"V0.9.3",UI_MUTED,1);
-    display_text(139,18,"0:SET",UI_ACCENT,1);
+    display_text(132,8,"V0.9.4",UI_MUTED,1);
+    display_text(137,18,"0:SET",UI_ACCENT,1);
     battery_badge();
 
     display_rect(6,29,228,15,UI_PANEL);
     if(session.loaded){
         display_text(12,33,"SN",UI_MUTED,1);
-        fit_text(29,33,session.folder,16,UI_WHITE,1);
-        display_rect(127,36,3,3,session.unsaved?UI_WARN:session.changed?UI_ACCENT:UI_GOOD);
-        display_text(133,33,session.unsaved?"UNSAVED":session.is_donor?"DONOR":session.changed?"SAVED":"CLEAN",
-                     session.unsaved?UI_WARN:UI_MUTED,1);
+        // Fixed-size zones: identity through x=113, marker x=119, state
+        // through x=158, and independent SD/EEPROM badges from x=167.
+        fit_text(29,33,session.folder,14,UI_WHITE,1);
+        display_rect(119,36,3,3,session.unsaved?UI_WARN:session.changed?UI_ACCENT:UI_GOOD);
+        const char *work_state=session.unsaved?"EDIT*":session.is_donor?"DONOR":
+                               session.changed?"SAVED":"CLEAN";
+        display_text(127,33,work_state,session.unsaved?UI_WARN:UI_MUTED,1);
     }else{
         display_text(12,33,"NO IMAGE LOADED",UI_MUTED,1);
     }
@@ -430,7 +454,7 @@ static void render_menu(void)
     display_rect(0,114,WIDTH,1,UI_LINE);
     fit_text(8,116,menu_tips[menu_selected],37,
              menu_selected==6?UI_WARN:UI_WHITE,1);
-    display_text(8,126,"0:SET M:FX B:BAT P:PINS",UI_MUTED,1);
+    display_text(8,126,"0:SET M:FX B:BAT P:PIN H:HDD",UI_MUTED,1);
     char index[4]={(char)('1'+menu_selected),'/', '9',0};
     display_text(211,126,index,UI_ACCENT,1);
 }
@@ -478,12 +502,12 @@ static void render_inspect(void)
         list_item(LIST_FIRST_Y+(i-start)*LIST_STEP,label,i==inspect_selected,value,color);
     }
     scrollbar(inspect_selected,INSPECT_COUNT);
-    footer_indexed("W/S SCROLL  BACKSPACE BACK",inspect_selected,INSPECT_COUNT);
+    footer_indexed("W/S SCROLL   H HDD KEY   BACK",inspect_selected,INSPECT_COUNT);
 }
 static void render_edit(void)
 {
     header("EDIT WORKING",session.unsaved?"UNSAVED / LOCAL CHANGES":"OFFLINE - NO CHIP WRITES");
-    static const char *tab_names[IMAGE_GROUP_COUNT]={"ID","VIDEO","AUDIO","REGION","PARENT","NET"};
+    static const char *tab_names[IMAGE_GROUP_COUNT]={"ID","VIDEO","AUDIO","REG","PAR","NET"};
     for(int i=0;i<IMAGE_GROUP_COUNT;i++){
         int x=7+i*38;
         bool focus=(int)edit_group==i;
@@ -612,7 +636,7 @@ static void render_battery(void)
     display_text(12,76,volts,UI_WHITE,1);
     display_text(12,91,"VOLTAGE TREND",UI_MUTED,1);
     display_text(129,91,battery_trend_name(b.trend),b.trend==BATTERY_TREND_UNKNOWN?UI_MUTED:UI_CYAN,1);
-    display_text(12,105,"CHARGE/CURRENT: NOT MEASURED",UI_WARN,1);
+    display_text(12,105,"CHARGING / mA: NO SENSOR",UI_WARN,1);
     footer("B / BACK RETURN  -  SOC APPROX");
 }
 
@@ -655,7 +679,7 @@ static void render_settings(void)
                   i==settings_selected,value,i==settings_selected?UI_CYAN:UI_GOOD);
     }
     scrollbar(settings_selected,SETTINGS_COUNT);
-    footer_indexed("W/S NAV   A/D CHANGE   ENTER OPEN",settings_selected,SETTINGS_COUNT);
+    footer_indexed("W/S NAV  A/D SET  ENTER OPEN",settings_selected,SETTINGS_COUNT);
 }
 static void render_wifi_scan(void)
 {
@@ -687,7 +711,13 @@ static void render_wifi_password(void)
     snprintf(detail,sizeof(detail),"%u CHARACTERS / TAB %s",(unsigned)wifi_password_len,
              wifi_password_visible?"HIDE":"SHOW");
     display_text(12,98,detail,UI_MUTED,1);
-    display_text(12,110,wifi_password_error?"WPA2 PASSWORD: 8-63 CHARACTERS":"OPEN NETWORK: LEAVE BLANK",wifi_password_error?UI_BAD:UI_MUTED,1);
+    // Reflect the selected network security; an encrypted SSID must not be
+    // labeled OPEN just because the password entry is not showing an error.
+    const bool secured=wifi_selected<(int)wifi_network_count &&
+                       wifi_networks[wifi_selected].encrypted;
+    display_text(12,110,wifi_password_error?"WPA2: 8-63 CHARACTERS":
+                 secured?"WPA2 PASSWORD: 8-63 CHARS":"OPEN NETWORK: LEAVE BLANK",
+                 wifi_password_error?UI_BAD:UI_MUTED,1);
     footer("ENTER JOIN  BACK DELETE  ESC CANCEL");
 }
 static void render_wifi_status(void)
@@ -700,17 +730,18 @@ static void render_wifi_status(void)
         fit_text(13,61,st.station_ssid,34,UI_CYAN,1);
         fit_text(13,74,st.station_ip,30,UI_GOOD,1);
     }else if(st.ap_running){
-        fit_text(13,61,st.ap_ssid,34,UI_CYAN,1);
-        fit_text(13,74,st.ap_password,28,UI_WARN,1);
-        display_text(13,87,"WPA2 KEY (PRIVATE)",UI_MUTED,1);
-        fit_text(13,99,st.ap_ip,28,UI_GOOD,1);
+        fit_text(13,60,st.ap_ssid,34,UI_CYAN,1);
+        fit_text(13,72,st.ap_password,28,UI_WARN,1);
+        display_text(13,84,"WPA2 KEY (PRIVATE)",UI_MUTED,1);
+        fit_text(13,96,st.ap_ip,28,UI_GOOD,1);
     }else{
         display_text(13,70,st.has_profile?"WAITING FOR NETWORK / FALLBACK":"NO SAVED NETWORK",UI_WARN,1);
     }
     if(web_files_running()){
         char url[40];
         snprintf(url,sizeof(url),"HTTP://%s/",st.station_connected?st.station_ip:st.ap_ip);
-        fit_text(117,105,url,20,UI_ACCENT,1);
+        // Its own full-width row: never collide with the SoftAP IP label.
+        fit_text(13,107,url,35,UI_ACCENT,1);
     }
     footer("BACK TO SETTINGS   HTTP / PRIVATE LAN");
 }
@@ -817,7 +848,7 @@ static void render_diagnostics(void)
     display_text(12,98,"CHIP 0X54",UI_MUTED,1);
     fit_text(83,98,!eeprom_checked?"NOT YET CHECKED":eeprom_detected?"DETECTED":
              esp_err_to_name(eeprom_probe_error),25,eeprom_detected?UI_GOOD:UI_WARN,1);
-    fit_text(12,110,storage_last_hint()[0]?storage_last_hint():"FAT ROOT /EEPROMs",37,UI_WARN,1);
+    fit_text(12,110,storage_last_hint()[0]?storage_last_hint():"FAT ROOT /EEPROMs",35,UI_WARN,1);
     footer("ENTER RETEST   BACK SETTINGS");
 }
 static void run_diagnostics(void)
@@ -849,7 +880,7 @@ static void render_pins(void)
 }
 static void render_donor_mode(void)
 {
-    header("CREATE DONOR","CHOOSE A SOURCE - NEVER WRITES CHIP");
+    header("CREATE DONOR","SOURCE MODE / NO CHIP WRITES");
     static const char *modes[]={"FROM SCRATCH","COPY LOADED IMAGE","COPY IMAGE FROM SD"};
     static const char *details[]={"AUTO-SAVES NEW IMAGE TO SD","EDIT IN RAM, SAVE WHEN READY","LOAD FROM SD, EDIT, THEN SAVE"};
     for(int i=0;i<3;i++){
@@ -884,6 +915,61 @@ static void render_confirm_write(void)
                  write_security_changes?"WARNING: HDD / SECURITY CHANGE":"CHECK TARGET AND IMAGE",UI_WARN,1);
     footer(write_armed?"ENTER WRITE NOW / BACK CANCEL":"PRESS W TO ARM / BACK CANCEL");
 }
+/* HDD Recovery: authenticated Xbox HDD key and an optional drive-specific
+ * ATA USER password. All input is from the existing Cardputer/Remote keyboard
+ * events; no IDE/ATA commands or direct hardware writes are issued.
+ */
+static void render_hdd_recovery(void)
+{
+    header("HDD RECOVERY",session.is_donor?"VERIFIED DONOR / WORKING COPY":
+           "VERIFIED EEPROM / WORKING COPY");
+    display_text(12,45,"XBOX HDD KEY / 16 BYTES",UI_MUTED,1);
+    display_text(12,57,recovered_hdd_key,UI_CYAN,1);
+    display_text(12,73,"M:",UI_ACCENT,1);
+    fit_text(30,73,hdd_drive_model[0]?hdd_drive_model:"[ENTER DRIVE MODEL]",33,UI_WHITE,1);
+    display_text(12,89,"S:",UI_ACCENT,1);
+    fit_text(30,89,hdd_drive_serial[0]?hdd_drive_serial:"[ENTER DRIVE SERIAL]",33,UI_WHITE,1);
+    const bool ready=hdd_recovery_ata_fields_valid(hdd_drive_model,hdd_drive_serial);
+    const bool incomplete=hdd_drive_model[0]||hdd_drive_serial[0];
+    fit_text(12,106,
+             hdd_entry_error?"COMPLETE BOTH DRIVE FIELDS":
+             ready?"ATA PASSWORD READY / P TO VIEW":
+             incomplete?"ATA NEEDS VALID MODEL + SERIAL":
+             "ENTER SAVES HDD KEY ONLY",35,
+             hdd_entry_error?UI_BAD:ready?UI_GOOD:UI_WARN,1);
+    footer("M MODEL S SERIAL P VIEW ENTER SAVE");
+}
+static void render_hdd_field_edit(void)
+{
+    const unsigned limit=hdd_edit_model?HDD_DRIVE_MODEL_MAX:HDD_DRIVE_SERIAL_MAX;
+    header(hdd_edit_model?"HDD MODEL":"HDD SERIAL",
+           hdd_edit_model?"EXACT ATA IDENTIFY MODEL":"EXACT ATA IDENTIFY SERIAL");
+    display_text(12,50,"TYPE EXACT STRING / KEEP CASE",UI_MUTED,1);
+    display_rect(8,66,224,28,UI_PANEL);
+    display_frame(8,66,224,28,hdd_entry_error?UI_BAD:UI_ACCENT);
+    const size_t start=hdd_edit_len>32?hdd_edit_len-32:0;
+    fit_text(15,76,hdd_edit_text+start,32,UI_WHITE,1);
+    const int cursor_x=15+(int)(hdd_edit_len-start)*6;
+    if(cursor_x<231)display_rect(cursor_x,88,4,2,UI_ACCENT);
+    char count[34];
+    snprintf(count,sizeof(count),"%u / %u CHARACTERS",(unsigned)hdd_edit_len,limit);
+    display_text(12,102,count,hdd_entry_error?UI_BAD:UI_MUTED,1);
+    footer("ENTER APPLY  DEL DELETE  FN+` EXIT");
+}
+static void render_hdd_ata_password(void)
+{
+    header("ATA USER PASSWORD","DRIVE-SPECIFIC / HMAC-SHA1");
+    display_text(12,49,"32-BYTE ATA USER PASSWORD",UI_MUTED,1);
+    char part[33];
+    memcpy(part,hdd_ata_password,32);part[32]=0;
+    display_text(12,65,part,UI_CYAN,1);
+    memcpy(part,hdd_ata_password+32,32);part[32]=0;
+    display_text(12,81,part,UI_CYAN,1);
+    display_text(12,100,"FIRST 20 BYTES: HMAC-SHA1",UI_MUTED,1);
+    display_text(12,111,"FINAL 12 BYTES: ZERO",UI_WARN,1);
+    footer("ENTER SAVE TXT   BACK DETAILS");
+}
+
 static void render(void)
 {
     switch(page){
@@ -907,6 +993,9 @@ static void render(void)
         case PAGE_WIFI_PASSWORD:render_wifi_password();break;
         case PAGE_WIFI_STATUS:render_wifi_status();break;
         case PAGE_DIAGNOSTICS:render_diagnostics();break;
+        case PAGE_HDD_RECOVERY:render_hdd_recovery();break;
+        case PAGE_HDD_FIELD_EDIT:render_hdd_field_edit();break;
+        case PAGE_HDD_ATA_PASSWORD:render_hdd_ata_password();break;
     }
     display_present();
 }
@@ -1271,6 +1360,131 @@ static bool mount_sd_for_browser(void)
     operation_guard_release();
     return sd_ok;
 }
+static void recovery_clear_key(void)
+{
+    volatile char *p=(volatile char *)recovered_hdd_key;
+    for(size_t i=0;i<sizeof(recovered_hdd_key);i++)p[i]=0;
+    p=(volatile char *)hdd_ata_password;
+    for(size_t i=0;i<sizeof(hdd_ata_password);i++)p[i]=0;
+    p=(volatile char *)hdd_edit_text;
+    for(size_t i=0;i<sizeof(hdd_edit_text);i++)p[i]=0;
+    memset(hdd_drive_model,0,sizeof(hdd_drive_model));
+    memset(hdd_drive_serial,0,sizeof(hdd_drive_serial));
+    hdd_edit_len=0;hdd_entry_error=false;
+}
+static void begin_hdd_field_edit(bool model)
+{
+    hdd_edit_model=model;
+    snprintf(hdd_edit_text,sizeof(hdd_edit_text),"%s",model?hdd_drive_model:hdd_drive_serial);
+    hdd_edit_len=strlen(hdd_edit_text);
+    hdd_entry_error=false;
+    page=PAGE_HDD_FIELD_EDIT;
+}
+static void handle_hdd_field_edit(cp_key_event_t e)
+{
+    if(e.type==CP_KEY_CANCEL){
+        memset(hdd_edit_text,0,sizeof(hdd_edit_text));
+        hdd_entry_error=false;page=PAGE_HDD_RECOVERY;return;
+    }
+    if(e.type==CP_KEY_BACKSPACE){
+        if(hdd_edit_len)hdd_edit_text[--hdd_edit_len]=0;
+        else {page=PAGE_HDD_RECOVERY;hdd_entry_error=false;}
+        return;
+    }
+    if(e.type==CP_KEY_ENTER){
+        char *target=hdd_edit_model?hdd_drive_model:hdd_drive_serial;
+        const size_t capacity=hdd_edit_model?sizeof(hdd_drive_model):sizeof(hdd_drive_serial);
+        snprintf(target,capacity,"%s",hdd_edit_text);
+        memset(hdd_edit_text,0,sizeof(hdd_edit_text));
+        memset(hdd_ata_password,0,sizeof(hdd_ata_password));
+        hdd_edit_len=0;hdd_entry_error=false;
+        page=PAGE_HDD_RECOVERY;return;
+    }
+    if(e.type!=CP_KEY_CHAR)return;
+    const unsigned char ch=(unsigned char)e.character;
+    const size_t limit=hdd_edit_model?HDD_DRIVE_MODEL_MAX:HDD_DRIVE_SERIAL_MAX;
+    if(ch<0x20u||ch>0x7eu||hdd_edit_len>=limit){hdd_entry_error=true;return;}
+    hdd_edit_text[hdd_edit_len++]=(char)ch;
+    hdd_edit_text[hdd_edit_len]=0;
+    hdd_entry_error=false;
+}
+static void view_hdd_ata_password(void)
+{
+    if(!hdd_recovery_ata_fields_valid(hdd_drive_model,hdd_drive_serial)){
+        hdd_entry_error=true;return;
+    }
+    if(!hdd_recovery_ata_password_hex(session.working,hdd_drive_model,hdd_drive_serial,
+                                       hdd_ata_password)){
+        hdd_entry_error=true;return;
+    }
+    hdd_entry_error=false;
+    page=PAGE_HDD_ATA_PASSWORD;
+}
+static void open_hdd_recovery(void)
+{
+    if(!requires_image())return;
+    char key[HDD_RECOVERY_KEY_HEX_SIZE]={0};
+    if(!hdd_recovery_key_hex(session.working,key)){
+        show_message(false,"HDD KEY UNAVAILABLE","EEPROM SECURITY INVALID",
+                     "CANNOT DECRYPT HDD KEY","TRY A VALID BACKUP");
+        return;
+    }
+    recovery_return_page=page;
+    recovery_clear_key();
+    memcpy(recovered_hdd_key,key,sizeof(key));
+    volatile char *p=(volatile char *)key;
+    for(size_t i=0;i<sizeof(key);i++)p[i]=0;
+    page=PAGE_HDD_RECOVERY;
+}
+static void save_hdd_recovery(void)
+{
+    /* Both fields or neither: do not silently export a wrong ATA password. */
+    if((hdd_drive_model[0]||hdd_drive_serial[0])&&
+       !hdd_recovery_ata_fields_valid(hdd_drive_model,hdd_drive_serial)){
+        page=PAGE_HDD_RECOVERY;hdd_entry_error=true;return;
+    }
+    if(!session.loaded||!acquire_operation_or_warn())return;
+    char report[HDD_RECOVERY_REPORT_MAX]={0};
+    char folder[STORAGE_NAME_SIZE]={0},filename[STORAGE_NAME_SIZE]={0};
+    if(!hdd_recovery_report_for_drive(session.working,session.from_chip,session.is_donor,
+                                      hdd_drive_model,hdd_drive_serial,report,sizeof(report))){
+        show_message(false,"HDD RECOVERY FAILED","EEPROM SECURITY INVALID",
+                     "KEY NOT EXPORTED","EEPROM NOT MODIFIED");
+        goto finish;
+    }
+    if(!sd_ok)sd_ok=storage_init()==ESP_OK;
+    if(!sd_ok){
+        show_message(false,"SD NOT WRITABLE",storage_last_error(),
+                     storage_last_hint(),"KEY REMAINS IN RAM");
+        goto finish;
+    }
+    progress_reset();
+    progress_draw("SAVE HDD KEY","PREPARING FAT32 FOLDER",20,0,0,"NO EEPROM CHIP WRITE");
+    esp_err_t err=storage_folder_for_raw(session.working,folder,sizeof(folder));
+    if(err!=ESP_OK){
+        show_message(false,"HDD TXT FOLDER FAILED",storage_last_error(),
+                     storage_last_hint(),"NOTHING SAVED");
+        goto finish;
+    }
+    progress_draw("SAVE HDD KEY","WRITING / VERIFYING TXT",70,0,0,"SENSITIVE RECOVERY FILE");
+    err=storage_save_hdd_report(folder,report,strlen(report),filename,sizeof(filename));
+    if(err!=ESP_OK){
+        sd_ok=storage_ready();
+        show_message(false,"HDD TXT SAVE FAILED",storage_last_error(),
+                     storage_last_hint(),"ORIGINAL BIN UNCHANGED");
+        goto finish;
+    }
+    progress_draw("SAVE HDD KEY","FAT TEXT READBACK MATCHED",100,0,0,"RECOVERY FILE VERIFIED");
+    show_message(true,"HDD RECOVERY SAVED",folder,filename,"KEEP TXT PRIVATE / SECURE");
+finish:
+    {
+        volatile char *p=(volatile char *)report;
+        for(size_t i=0;i<sizeof(report);i++)p[i]=0;
+    }
+    recovery_clear_key();
+    operation_guard_release();
+}
+
 static void select_menu(void)
 {
     switch(menu_selected){
@@ -1315,6 +1529,7 @@ static void handle_key(cp_key_event_t e)
             else if(e.type==CP_KEY_CHAR&&e.character=='0'){
                 settings_selected=0;page=PAGE_SETTINGS;
             }
+            else if(e.type==CP_KEY_CHAR&&(e.character=='h'||e.character=='H'))open_hdd_recovery();
             else if(e.type==CP_KEY_CHAR&&(e.character=='p'||e.character=='P'))page=PAGE_PINS;
             else if(e.type==CP_KEY_CHAR&&(e.character=='b'||e.character=='B'))page=PAGE_BATTERY;
             else if(e.type==CP_KEY_CHAR&&(e.character=='m'||e.character=='M')) {
@@ -1332,7 +1547,8 @@ static void handle_key(cp_key_event_t e)
             if(e.type==CP_KEY_ENTER||back(e))page=PAGE_MENU;
             break;
         case PAGE_INSPECT:
-            if(up(e)){inspect_selected--;clamp_selection(&inspect_selected,INSPECT_COUNT);}
+            if(e.type==CP_KEY_CHAR&&(e.character=='h'||e.character=='H'))open_hdd_recovery();
+            else if(up(e)){inspect_selected--;clamp_selection(&inspect_selected,INSPECT_COUNT);}
             else if(down(e)){inspect_selected++;clamp_selection(&inspect_selected,INSPECT_COUNT);}
             else if(back(e))page=PAGE_MENU;
             break;
@@ -1454,6 +1670,21 @@ static void handle_key(cp_key_event_t e)
         case PAGE_WIFI_STATUS:
             if(back(e)||e.type==CP_KEY_ENTER)page=PAGE_SETTINGS;
             break;
+        case PAGE_HDD_RECOVERY:
+            if(back(e)){recovery_clear_key();page=recovery_return_page;}
+            else if(e.type==CP_KEY_CHAR&&(e.character=='m'||e.character=='M'))
+                begin_hdd_field_edit(true);
+            else if(e.type==CP_KEY_CHAR&&(e.character=='s'||e.character=='S'))
+                begin_hdd_field_edit(false);
+            else if(e.type==CP_KEY_CHAR&&(e.character=='p'||e.character=='P'))
+                view_hdd_ata_password();
+            else if(e.type==CP_KEY_ENTER)save_hdd_recovery();
+            break;
+        case PAGE_HDD_FIELD_EDIT:handle_hdd_field_edit(e);break;
+        case PAGE_HDD_ATA_PASSWORD:
+            if(back(e)){memset(hdd_ata_password,0,sizeof(hdd_ata_password));page=PAGE_HDD_RECOVERY;}
+            else if(e.type==CP_KEY_ENTER)save_hdd_recovery();
+            break;
         case PAGE_DIAGNOSTICS:
             if(back(e))page=PAGE_SETTINGS;
             else if(e.type==CP_KEY_ENTER)run_diagnostics();
@@ -1472,32 +1703,80 @@ static void handle_key(cp_key_event_t e)
 }
 void app_main(void)
 {
-    ESP_LOGI(TAG,"M5 Prom v0.9.3 - Xbox EEPROM Suite");
+    ESP_LOGI(TAG,"M5 Prom v0.9.4 - Xbox EEPROM Suite");
     ESP_ERROR_CHECK(display_init());
-    if(!operation_guard_init())ESP_LOGW(TAG,"Operation gate unavailable: SD/EEPROM actions disabled");
+    /* Flash-resident art is displayed before mounting SD or starting Wi-Fi.
+     * The bar tracks completed work, not an estimated time-to-boot.
+     */
+    display_show_splash();
+    display_splash_progress(m5_boot_percent(M5_BOOT_START),
+                            m5_boot_text(M5_BOOT_START, true));
+
+    if(!operation_guard_init())
+        ESP_LOGW(TAG,"Operation gate unavailable: SD/EEPROM actions disabled");
     settings_init();
     (void)display_set_brightness(settings_brightness());
-    const uint32_t splash_start_ms=(uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
-    display_show_splash();  /* Embedded in firmware; works with NO microSD card. */
+    display_splash_progress(m5_boot_percent(M5_BOOT_SETTINGS),
+                            m5_boot_text(M5_BOOT_SETTINGS, true));
+
     keyboard_init();
-    (void)sound_init(); /* nonfatal and independent of SD/I2C */
+    display_splash_progress(m5_boot_percent(M5_BOOT_KEYBOARD),
+                            m5_boot_text(M5_BOOT_KEYBOARD, true));
+
+    display_splash_progress(m5_boot_percent(M5_BOOT_KEYBOARD), "STARTING AUDIO");
+    const bool audio_ok=sound_init(); /* Nonfatal. */
+    display_splash_progress(m5_boot_percent(M5_BOOT_SOUND),
+                            m5_boot_text(M5_BOOT_SOUND, audio_ok));
+
+    display_splash_progress(m5_boot_percent(M5_BOOT_SOUND), "MOUNTING SD CARD");
     sd_ok=storage_init()==ESP_OK;
+    display_splash_progress(m5_boot_percent(M5_BOOT_STORAGE),
+                            m5_boot_text(M5_BOOT_STORAGE, sd_ok));
+
+    display_splash_progress(m5_boot_percent(M5_BOOT_STORAGE), "PROBING EEPROM");
     i2c_ok=eeprom_init()==ESP_OK;
     refresh_eeprom_detection();
+    display_splash_progress(m5_boot_percent(M5_BOOT_EEPROM),
+                            m5_boot_text(M5_BOOT_EEPROM, i2c_ok && eeprom_detected));
+
     // Wi-Fi is initialized before battery ADC due to one-time SoftAP key entropy.
+    display_splash_progress(m5_boot_percent(M5_BOOT_EEPROM), "STARTING WI-FI");
     wifi_ok=wifi_manager_init()==ESP_OK;
     if(!wifi_ok)ESP_LOGW(TAG,"Wi-Fi unavailable; offline EEPROM functions remain usable");
+    display_splash_progress(m5_boot_percent(M5_BOOT_WIFI),
+                            m5_boot_text(M5_BOOT_WIFI, wifi_ok));
+
+    display_splash_progress(m5_boot_percent(M5_BOOT_WIFI), "CHECKING BATTERY");
     battery_ok=battery_init()==ESP_OK;
+    display_splash_progress(m5_boot_percent(M5_BOOT_BATTERY),
+                            m5_boot_text(M5_BOOT_BATTERY, battery_ok));
+
+    display_splash_progress(m5_boot_percent(M5_BOOT_BATTERY), "STARTING USB REMOTE");
+    esp_err_t rem_err=remote_usb_init();
+    if(rem_err!=ESP_OK)ESP_LOGW(TAG,"USB remote unavailable: %s",esp_err_to_name(rem_err));
+    display_splash_progress(m5_boot_percent(M5_BOOT_USB),
+                            m5_boot_text(M5_BOOT_USB, rem_err==ESP_OK));
+
     uint32_t last_battery_ms=(uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
     if(battery_ok)(void)battery_tick(last_battery_ms);
-    const uint32_t elapsed=(uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS)-splash_start_ms;
-    if(elapsed<1400u)vTaskDelay(pdMS_TO_TICKS(1400u-elapsed));
+    display_splash_progress(m5_boot_percent(M5_BOOT_READY),
+                            m5_boot_text(M5_BOOT_READY, true));
+    /* No fixed 1.4-second splash hold. Once initialization is done, proceed. */
     bool redraw=true,dimmed=false;
     uint32_t last_input_ms=(uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
     uint32_t last_net_ms=0;
+    bool last_remote=false;
     for(;;){
         const uint32_t now_ms=(uint32_t)(xTaskGetTickCount()*portTICK_PERIOD_MS);
-        cp_key_event_t ev=keyboard_poll();
+        bool pc_connected=remote_usb_active();
+        if(pc_connected!=last_remote){
+            last_remote=pc_connected;redraw=true;last_input_ms=now_ms;
+            dimmed=false;(void)display_set_brightness(settings_brightness());
+        }
+        /* Physical keys are ignored in PC Mode; the same handle_key path is used. */
+        uint16_t remote_key_sequence=PROM_KEY_SEQ_LEGACY;
+        cp_key_event_t ev=pc_connected?
+            remote_usb_poll_key_with_sequence(&remote_key_sequence):keyboard_poll();
         if(ev.type!=CP_KEY_NONE){
             last_input_ms=now_ms;
             if(dimmed){
@@ -1507,7 +1786,7 @@ void app_main(void)
             redraw=true;
         }
         uint16_t dim_delay=settings_dim_seconds();
-        if(!dimmed && dim_delay>0 && (uint32_t)(now_ms-last_input_ms)>=(uint32_t)dim_delay*1000u){
+        if(!pc_connected && !dimmed && dim_delay>0 && (uint32_t)(now_ms-last_input_ms)>=(uint32_t)dim_delay*1000u){
             dimmed=true;
             uint8_t level=settings_brightness();
             (void)display_set_brightness(level<15?level:15);
@@ -1518,11 +1797,15 @@ void app_main(void)
             web_files_tick(settings_web_enabled(),wifi_manager_network_up());
             if(page==PAGE_SETTINGS||page==PAGE_WIFI_STATUS)redraw=true;
         }
-        if(battery_ok&&(uint32_t)(now_ms-last_battery_ms)>=3000u){
+        if(battery_ok&&(uint32_t)(now_ms-last_battery_ms)>=1000u){
             last_battery_ms=now_ms;
             if(battery_tick(now_ms))redraw=true;
         }
         if(redraw){render();redraw=false;}
+        /* An ACK means the UI handler and render returned, not that the host
+           has painted the resulting frame. Host measures that separately. */
+        if(ev.type!=CP_KEY_NONE && pc_connected)
+            remote_usb_key_rendered(remote_key_sequence);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
