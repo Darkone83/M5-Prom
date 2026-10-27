@@ -10,6 +10,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <strings.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -72,6 +73,8 @@ static bool result_good=false;
 static int donor_selected=0,donor_mode_selected=0;
 static int settings_selected=0,wifi_selected=0;
 static bool wifi_ok=false,wifi_password_visible=false,wifi_password_error=false;
+static esp_err_t usb_init_error=ESP_OK;
+static bool usb_initialized=false;
 static m5_wifi_scan_entry_t wifi_networks[12];
 static size_t wifi_network_count=0;
 static char wifi_selected_ssid[33],wifi_password[65];
@@ -99,27 +102,64 @@ static bool hdd_edit_model=true,hdd_entry_error=false;
  */
 #define FM_ROOT_DIR "EEPROMs"
 typedef enum {FM_EDIT_NEW_FOLDER=0,FM_EDIT_RENAME} fm_edit_action_t;
-static char fm_dir[SD_BROWSER_DIR_MAX];
-static char fm_target[SD_BROWSER_NAME_MAX];
-static char fm_name_input[SD_BROWSER_NAME_MAX];
+/* Keep the full-size FAT32 browser buffers OFF the permanent .bss heap.
+ * In the preceding build they reserved ~6 KiB at boot, BEFORE USB Remote
+ * allocates its 64,800-byte contiguous internal-memory snapshot and TinyUSB
+ * buffers. Allocate only when File Manager is opened and release on exit.
+ * This avoids reducing the boot-time memory headroom of the working USB build.
+ */
+typedef struct {
+    char dir[SD_BROWSER_DIR_MAX];
+    char target[SD_BROWSER_NAME_MAX];
+    char name_input[SD_BROWSER_NAME_MAX];
+    char copy_source_dir[SD_BROWSER_DIR_MAX];
+    char copy_source_name[SD_BROWSER_NAME_MAX];
+    char saved_dir[SD_BROWSER_DIR_MAX];
+    sd_browser_entry_t items[SD_BROWSER_PAGE_SIZE];
+    char notice_title[38],notice_detail[72];
+    char text_rows[STORAGE_TEXT_ROWS][STORAGE_TEXT_COLS+1];
+} fm_buffers_t;
+static fm_buffers_t *fm_mem=NULL;
+static bool fm_allocate(void)
+{
+    if(!fm_mem)fm_mem=calloc(1,sizeof(*fm_mem));
+    return fm_mem!=NULL;
+}
+static void fm_release(void)
+{
+    if(!fm_mem)return;
+    /* TXT views can include recovered HDD keys: scrub before releasing. */
+    volatile unsigned char *p=(volatile unsigned char *)fm_mem;
+    for(size_t i=0;i<sizeof(*fm_mem);i++)p[i]=0;
+    free(fm_mem);
+    fm_mem=NULL;
+}
+#define fm_dir (fm_mem->dir)
+#define fm_target (fm_mem->target)
+#define fm_name_input (fm_mem->name_input)
+#define fm_copy_source_dir (fm_mem->copy_source_dir)
+#define fm_copy_source_name (fm_mem->copy_source_name)
+#define fm_saved_dir (fm_mem->saved_dir)
+#define fm_items (fm_mem->items)
+#define fm_notice_title (fm_mem->notice_title)
+#define fm_notice_detail (fm_mem->notice_detail)
+#define fm_text_rows (fm_mem->text_rows)
 static size_t fm_name_length=0;
 static fm_edit_action_t fm_edit_action=FM_EDIT_RENAME;
 static bool fm_name_error=false,fm_target_dir=false,fm_delete_armed=false;
 static bool fm_copy_mode=false;
-static char fm_copy_source_dir[SD_BROWSER_DIR_MAX];
-static char fm_copy_source_name[SD_BROWSER_NAME_MAX];
-static char fm_saved_dir[SD_BROWSER_DIR_MAX];
 static size_t fm_saved_offset=0;
 static int fm_saved_selection=0;
-static sd_browser_entry_t fm_items[SD_BROWSER_PAGE_SIZE];
 static size_t fm_count=0,fm_total=0,fm_offset=0;
 static int fm_selected=0;
 static bool fm_notice_good=false;
-static char fm_notice_title[38],fm_notice_detail[72];
 static size_t fm_text_start=0,fm_text_total=0;
 static bool fm_text_truncated=false;
-static char fm_text_rows[STORAGE_TEXT_ROWS][STORAGE_TEXT_COLS+1];
 static uint64_t fm_file_size=0;
+static bool fm_is_page(page_t p)
+{
+    return p>=PAGE_FM_FOLDERS && p<=PAGE_FM_HELP;
+}
 
 #define WIDTH 240
 #define LIST_FIRST_Y 46
@@ -991,7 +1031,14 @@ static void render_diagnostics(void)
     display_text(12,98,"CHIP 0X54",UI_MUTED,1);
     fit_text(83,98,!eeprom_checked?"NOT YET CHECKED":eeprom_detected?"DETECTED":
              esp_err_to_name(eeprom_probe_error),25,eeprom_detected?UI_GOOD:UI_WARN,1);
-    fit_text(12,110,storage_last_hint()[0]?storage_last_hint():"FAT ROOT /EEPROMs",35,UI_WARN,1);
+    if(usb_initialized && usb_init_error!=ESP_OK){
+        char usb_line[48];
+        snprintf(usb_line,sizeof(usb_line),"USB START FAILED: %s",
+                 esp_err_to_name(usb_init_error));
+        fit_text(12,110,usb_line,35,UI_BAD,1);
+    }else{
+        fit_text(12,110,storage_last_hint()[0]?storage_last_hint():"USB REMOTE READY",35,UI_WARN,1);
+    }
     footer("ENTER RETEST   BACK SETTINGS");
 }
 static void run_diagnostics(void)
@@ -1839,6 +1886,11 @@ static void fm_move(int increment)
 }
 static void fm_open(void)
 {
+    if(!fm_allocate()){
+        show_message(false,"FILE MANAGER MEMORY","INSUFFICIENT FREE RAM",
+                     "CLOSE UNUSED SERVICES / RETRY", "USB REMOTE NOT MODIFIED");
+        return;
+    }
     if(!storage_mounted()){
         if(!fm_guard())return;
         sd_ok=storage_init()==ESP_OK;
@@ -2276,6 +2328,9 @@ static void handle_key(cp_key_event_t e)
             else if(e.type==CP_KEY_ENTER&&write_armed)do_commit_write();
             break;
     }
+    /* Also free after Verify opens a result page or Back exits the manager.
+     * The buffers are unnecessary until the user opens F again. */
+    if(fm_mem && !fm_is_page(page))fm_release();
 }
 void app_main(void)
 {
@@ -2329,6 +2384,8 @@ void app_main(void)
 
     display_splash_progress(m5_boot_percent(M5_BOOT_BATTERY), "STARTING USB REMOTE");
     esp_err_t rem_err=remote_usb_init();
+    usb_init_error=rem_err;  /* retained for Settings > Diagnostics */
+    usb_initialized=true;
     if(rem_err!=ESP_OK)ESP_LOGW(TAG,"USB remote unavailable: %s",esp_err_to_name(rem_err));
     display_splash_progress(m5_boot_percent(M5_BOOT_USB),
                             m5_boot_text(M5_BOOT_USB, rem_err==ESP_OK));
