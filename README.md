@@ -46,7 +46,7 @@ Manufacturing files (Gerbers, BOM and pick-and-place) belong in [`pcb/`](pcb/). 
 
 ## Web flasher
 
-[Install M5 Prom from your browser](https://darkone83.github.io/YOUR-REPOSITORY-NAME/)
+[Install M5 Prom from your browser](https://darkone83.github.io/M5-Prom/)
 
 Flash M5 Prom directly to your original M5Stack Cardputer / v1.1
 using desktop Chrome or Edge and a USB-C data cable.
