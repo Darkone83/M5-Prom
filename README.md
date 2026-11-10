@@ -331,7 +331,7 @@ M5-Prom/
 
 ## Credits and licensing
 
-M5 Prom is a **Darkone83 Customs** project. The implementation draws on original Xbox EEPROM formats and community research, including the [XboxEepromEditor](https://github.com/Ernegien/XboxEepromEditor) project and Darkone83's XbDiag work.
+M5 Prom is a **Darkone83** project. The implementation draws on original Xbox EEPROM formats and community research, including the [XboxEepromEditor](https://github.com/Ernegien/XboxEepromEditor) project and Darkone83's XbDiag work.
 
 The source includes EEPROM timezone data derived from **XboxEepromEditor (GPL v2)**; see [`src/third_party_licenses/XboxEepromEditor_GPL-2.0.txt`](src/third_party_licenses/XboxEepromEditor_GPL-2.0.txt) and preserve applicable notices and source-distribution obligations. A separate top-level project license should be specified before the repository is formally released.
 
