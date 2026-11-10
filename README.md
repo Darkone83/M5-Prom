@@ -13,8 +13,6 @@
 
 M5 Prom is designed for console repair and recovery work. It uses a purpose-built Cardputer-to-LPC adapter to access the original Xbox's 256-byte EEPROM **while the console is powered off**, and stores backups and edited images as ordinary files on a FAT32 microSD card. No running Xbox dashboard, computer connection or network is required for EEPROM operations.
 
-> **Release status:** M5 Prom v0.9.4 is a pre-release build. The handheld application and USB desktop companion have been exercised on Cardputer hardware; final EEPROM operations and adapter validation are pending before public release. Firmware binaries may not be published until that validation is complete. The source is available in [`src/`](src/).
-
 
 ## Features
 
