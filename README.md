@@ -44,6 +44,13 @@ The adapter's **four-pin Cardputer/Grove connector (CN1)** carries `SCL`, `SDA`,
 
 Manufacturing files (Gerbers, BOM and pick-and-place) belong in [`pcb/`](pcb/). These are manufacturing files, not substitutes for checking the assembled board and cable before use.
 
+## Web flasher
+
+[Install M5 Prom from your browser](https://darkone83.github.io/YOUR-REPOSITORY-NAME/)
+
+Flash M5 Prom directly to your original M5Stack Cardputer / v1.1
+using desktop Chrome or Edge and a USB-C data cable.
+
 ## Getting started
 
 1. Insert a FAT32 microSD card into the Cardputer. Existing files can remain on the card; M5 Prom **does not format it**.
