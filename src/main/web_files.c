@@ -21,7 +21,10 @@
 
 static const char *TAG="m5_webfiles";
 static httpd_handle_t s_server;
-#define SD_BASE "/sdcard"
+#ifndef M5_PROM_SD_MOUNT_POINT
+#define M5_PROM_SD_MOUNT_POINT "/sdcard"
+#endif
+#define SD_BASE M5_PROM_SD_MOUNT_POINT
 #define MAX_PATH 240
 #define MAX_UPLOAD (16*1024*1024)
 #define IO_CHUNK 1024
@@ -172,7 +175,7 @@ static esp_err_t download_get(httpd_req_t *req)
         if(err!=ESP_OK)break;
     }
     if(ferror(fp))err=ESP_FAIL;
-    fclose(fp);
+    if(fclose(fp)!=0)err=ESP_FAIL;
     if(err==ESP_OK)err=httpd_resp_send_chunk(req,NULL,0);
     return err;
 }
@@ -239,7 +242,7 @@ static esp_err_t upload_post(httpd_req_t *req)
                 total+=(int)n;
             }
             if(ferror(fp)||total!=req->content_len||check!=crc)ok=false;
-            fclose(fp);
+            if(fclose(fp)!=0)ok=false;
         }
     }
     if(ok && !exists(path,&st) && rename(tmp,path)==0){

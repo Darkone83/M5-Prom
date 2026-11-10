@@ -1,5 +1,5 @@
 /*
- * M5 Prom v0.9.4 — Xbox EEPROM Suite
+ * M5 Prom v0.9.4-rc1 — Xbox EEPROM Suite
  * Read physical EEPROM -> preserve original on SD -> work on an offline copy.
  * Write only after EEPROM detection, repeated reads, verified SD backup,
  * explicit confirmation, then byte-write/verify. Supports donor generation.
@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_system.h"
 #include "display.h"
 #include "boot_progress.h"
 #include "keyboard.h"
@@ -36,6 +37,13 @@
 #include "bootloader_random.h"
 
 static const char *TAG="m5_prom";
+#define M5_PROM_BUILD_ID "0.9.4-rc1"
+/* app_main's default ESP-IDF stack is too small for nested FAT/crypto/UI
+ * operations. Size the application task in code so an existing sdkconfig
+ * also receives the fix. ESP-IDF task stack sizes are expressed in bytes. */
+#define M5_PROM_UI_STACK_BYTES 8192u
+static esp_reset_reason_t last_reset_reason=ESP_RST_UNKNOWN;
+static bool diagnostics_system_page=false;
 typedef enum {
     PAGE_MENU=0,PAGE_RESULT,PAGE_INSPECT,PAGE_EDIT,PAGE_REPAIR,
     PAGE_TEXT_EDIT,PAGE_CONFIRM_FIX,PAGE_CONFIRM_DISCARD,
@@ -86,6 +94,8 @@ static bool write_armed=false;
 static uint16_t write_diffs=0;
 static bool write_security_changes=false;
 static bool write_revision_mismatch=false;
+static unsigned write_warning_flags=0;
+static char write_warning_text[48];
 static char write_target_folder[STORAGE_NAME_SIZE];
 static char write_backup_name[STORAGE_NAME_SIZE];
 static page_t recovery_return_page=PAGE_MENU;
@@ -498,7 +508,10 @@ static void render_menu(void)
         display_text(12,33,"SN",UI_MUTED,1);
         // Fixed-size zones: identity through x=113, marker x=119, state
         // through x=158, and independent SD/EEPROM badges from x=167.
-        fit_text(29,33,session.folder,14,UI_WHITE,1);
+        char serial[13];
+        image_extract_serial(session.working,serial);
+        fit_text(29,33,serial,12,
+                 image_serial_valid(session.working)?UI_WHITE:UI_WARN,1);
         display_rect(119,36,3,3,session.unsaved?UI_WARN:session.changed?UI_ACCENT:UI_GOOD);
         const char *work_state=session.unsaved?"EDIT*":session.is_donor?"DONOR":
                                session.changed?"SAVED":"CLEAN";
@@ -544,25 +557,38 @@ static void render_result(void)
         fit_text(16,53+i*15,lines[i],36,i==3?UI_MUTED:UI_WHITE,1);
     footer("ENTER / BACKSPACE  RETURN");
 }
-static const int INSPECT_COUNT=12;
+static const int INSPECT_COUNT=17;
 static void inspect_line(int index,const image_report_t *r,char *name,size_t nc,
                          char *value,size_t vc,uint32_t *color)
 {
     *color=UI_WHITE;
     const uint8_t *raw=session.working;
     switch(index){
-        case 0:{char serial[13];image_extract_serial(raw,serial);snprintf(name,nc,"SERIAL");snprintf(value,vc,"%s",serial);break;}
-        case 1:snprintf(name,nc,"MAC");snprintf(value,vc,"%02X%02X%02X",raw[0x40],raw[0x41],raw[0x42]);break;
+        case 0:{char serial[13];image_extract_serial(raw,serial);snprintf(name,nc,"SERIAL");
+                snprintf(value,vc,"%s",serial);*color=r->serial_ok?UI_GOOD:UI_BAD;break;}
+        case 1:snprintf(name,nc,"MAC");
+               snprintf(value,vc,"%02X%02X%02X%02X%02X%02X",raw[0x40],raw[0x41],raw[0x42],
+                        raw[0x43],raw[0x44],raw[0x45]);*color=r->mac_ok?UI_GOOD:UI_BAD;break;
         case 2:snprintf(name,nc,"FACTORY SUM");snprintf(value,vc,"%s",r->factory_ok?"VALID":"INVALID");*color=r->factory_ok?UI_GOOD:UI_BAD;break;
         case 3:snprintf(name,nc,"USER SUM");snprintf(value,vc,"%s",r->user_ok?"VALID":"INVALID");*color=r->user_ok?UI_GOOD:UI_BAD;break;
         case 4:snprintf(name,nc,"SECURITY HASH");snprintf(value,vc,"%s",r->security_ok?"VALID":"INVALID");*color=r->security_ok?UI_GOOD:UI_BAD;break;
-        case 5:snprintf(name,nc,"VIDEO STD");image_edit_value(&session,IMAGE_EDIT_VIDEO_STD,value,vc);break;
-        case 6:snprintf(name,nc,"GAME REGION");image_edit_value(&session,IMAGE_EDIT_GAME_REGION,value,vc);break;
-        case 7:snprintf(name,nc,"LANGUAGE");image_edit_value(&session,IMAGE_EDIT_LANGUAGE,value,vc);break;
-        case 8:snprintf(name,nc,"DVD REGION");image_edit_value(&session,IMAGE_EDIT_DVD_REGION,value,vc);break;
+        case 5:snprintf(name,nc,"VIDEO STD");image_edit_value(&session,IMAGE_EDIT_VIDEO_STD,value,vc);*color=r->video_ok?UI_GOOD:UI_BAD;break;
+        case 6:snprintf(name,nc,"GAME REGION");image_edit_value(&session,IMAGE_EDIT_GAME_REGION,value,vc);
+               *color=!r->security_ok?UI_WARN:r->game_region_ok?UI_GOOD:UI_BAD;break;
+        case 7:snprintf(name,nc,"LANGUAGE");image_edit_value(&session,IMAGE_EDIT_LANGUAGE,value,vc);*color=r->language_ok?UI_GOOD:UI_BAD;break;
+        case 8:snprintf(name,nc,"DVD REGION");image_edit_value(&session,IMAGE_EDIT_DVD_REGION,value,vc);*color=r->dvd_ok?UI_GOOD:UI_BAD;break;
         case 9:snprintf(name,nc,"VIDEO FLAGS");snprintf(value,vc,"%s",r->video_flags_ok?"VALID":"INVALID");*color=r->video_flags_ok?UI_GOOD:UI_BAD;break;
         case 10:snprintf(name,nc,"PARENTAL");snprintf(value,vc,"%s",r->parental_ok?"VALID":"INVALID");*color=r->parental_ok?UI_GOOD:UI_BAD;break;
         case 11:snprintf(name,nc,"RATINGS");snprintf(value,vc,"%s",r->ratings_ok?"VALID":"INVALID");*color=r->ratings_ok?UI_GOOD:UI_BAD;break;
+        case 12:snprintf(name,nc,"SERIAL HEX A");
+                snprintf(value,vc,"%02X%02X%02X%02X%02X%02X",raw[0x34],raw[0x35],raw[0x36],
+                         raw[0x37],raw[0x38],raw[0x39]);*color=r->serial_ok?UI_MUTED:UI_WARN;break;
+        case 13:snprintf(name,nc,"SERIAL HEX B");
+                snprintf(value,vc,"%02X%02X%02X%02X%02X%02X",raw[0x3A],raw[0x3B],raw[0x3C],
+                         raw[0x3D],raw[0x3E],raw[0x3F]);*color=r->serial_ok?UI_MUTED:UI_WARN;break;
+        case 14:snprintf(name,nc,"AUDIO FLAGS");snprintf(value,vc,"%s",r->audio_ok?"VALID":"INVALID");*color=r->audio_ok?UI_GOOD:UI_BAD;break;
+        case 15:snprintf(name,nc,"TIMEZONE");image_edit_value(&session,IMAGE_EDIT_TIMEZONE,value,vc);*color=r->timezone_ok?UI_GOOD:UI_BAD;break;
+        case 16:snprintf(name,nc,"ONLINE KEY");snprintf(value,vc,"%s",r->online_key_ok?"NONZERO":"ALL ZERO");*color=r->online_key_ok?UI_GOOD:UI_WARN;break;
     }
 }
 static void render_inspect(void)
@@ -616,15 +642,17 @@ static void render_repair(void)
         if(image_fix_problem(&r,(image_fix_field_t)i))problems++;
     char subtitle[38];
     if(!r.security_ok)
-        snprintf(subtitle,sizeof(subtitle),"HMAC INVALID / %c FIELD FIXES",(char)('0'+problems));
+        snprintf(subtitle,sizeof(subtitle),"HMAC INVALID / %d FIELD FIXES",problems);
     else
-        snprintf(subtitle,sizeof(subtitle),"%c / 6 FIELD FIXES / RAM ONLY",(char)('0'+problems));
+        snprintf(subtitle,sizeof(subtitle),"%d / %d FIELD FIXES / RAM ONLY",problems,IMAGE_FIX_COUNT);
     header("REPAIR WORKING",subtitle);
     int start=list_start(repair_selected,IMAGE_FIX_COUNT);
     for(int i=start;i<IMAGE_FIX_COUNT&&i<start+LIST_VISIBLE;i++){
         bool problem=image_fix_problem(&r,(image_fix_field_t)i);
+        bool locked=i==IMAGE_FIX_GAME_REGION&&!r.security_ok;
         list_item(LIST_FIRST_Y+(i-start)*LIST_STEP,image_fix_label((image_fix_field_t)i),
-                  i==repair_selected,problem?"FIX":"OK",problem?UI_WARN:UI_GOOD);
+                  i==repair_selected,locked?"LOCK":problem?"FIX":"OK",
+                  locked?UI_BAD:problem?UI_WARN:UI_GOOD);
     }
     scrollbar(repair_selected,IMAGE_FIX_COUNT);
     footer_indexed("ENTER PREVIEW  BACKSPACE BACK",repair_selected,IMAGE_FIX_COUNT);
@@ -643,8 +671,14 @@ static void render_text_edit(void)
         int x=17+(int)entry_len*6;
         display_rect(x,80,5,2,entry_error?UI_BAD:UI_ACCENT);
     }
-    fit_text(11,94,image_edit_text_hint(text_field),35,entry_error?UI_BAD:UI_MUTED,1);
-    display_text(11,107,entry_error?"INVALID INPUT - CORRECT & RETRY":"LOCAL BUFFER ONLY - NO CHIP WRITES",entry_error?UI_BAD:UI_GOOD,1);
+    if(text_field==IMAGE_EDIT_PARENTAL_CODE){
+        display_text(11,94,"0:NONE 1:UP 2:DN 3:LEFT 4:RIGHT",UI_MUTED,1);
+        display_text(11,107,entry_error?"INVALID BUTTON CODE - USE 0-8/B/C":
+                     "5:A 6:B 7:X 8:Y B:LTRIG C:RTRIG",entry_error?UI_BAD:UI_GOOD,1);
+    }else{
+        fit_text(11,94,image_edit_text_hint(text_field),35,entry_error?UI_BAD:UI_MUTED,1);
+        display_text(11,107,entry_error?"INVALID INPUT - CORRECT & RETRY":"LOCAL BUFFER ONLY - NO CHIP WRITES",entry_error?UI_BAD:UI_GOOD,1);
+    }
     footer("ENTER APPLY  BACKSPACE DELETE  ESC");
 }
 static void notice(const char *title,const char *line2,const char *line3,uint32_t tint)
@@ -660,9 +694,22 @@ static void notice(const char *title,const char *line2,const char *line3,uint32_
 }
 static void render_confirm_fix(void)
 {
-    header("CONFIRM OFFLINE FIX","SAFE UNTIL YOU WRITE TO HARDWARE");
-    notice(image_fix_label(pending_fix),"CHANGES WORKING COPY ONLY",
-           "CHECK BEFORE SAVING",UI_WARN);
+    const char *effect="RECALCULATE SECTION CHECKSUM";
+    switch(pending_fix){
+        case IMAGE_FIX_VIDEO:effect="SET VIDEO STANDARD TO NTSC-M";break;
+        case IMAGE_FIX_LANGUAGE:effect="SET LANGUAGE TO ENGLISH";break;
+        case IMAGE_FIX_DVD:effect="SET DVD REGION TO 0";break;
+        case IMAGE_FIX_AUDIO:effect="MASK FLAGS / KEEP SURROUND";break;
+        case IMAGE_FIX_VIDEO_FLAGS:effect="REMOVE UNSUPPORTED VIDEO FLAGS";break;
+        case IMAGE_FIX_GAME_REGION:effect="SET GAME REGION TO N. AMERICA";break;
+        case IMAGE_FIX_TIMEZONE:effect="SET TIMEZONE TO LONDON PRESET";break;
+        case IMAGE_FIX_GAME_RATING:effect="SET GAME RATING TO 0";break;
+        case IMAGE_FIX_MOVIE_RATING:effect="SET MOVIE RATING TO 0";break;
+        case IMAGE_FIX_PARENTAL_CODE:effect="CLEAR PARENTAL BUTTON CODE";break;
+        default:break;
+    }
+    header("CONFIRM OFFLINE FIX","WORKING COPY / NO CHIP WRITES");
+    notice(image_fix_label(pending_fix),effect,"CHANGES WORKING COPY ONLY",UI_WARN);
     footer("ENTER APPLY  BACKSPACE CANCEL");
 }
 static void render_confirm_discard(void)
@@ -930,6 +977,13 @@ static void render_wifi_status(void)
 }
 static void open_wifi_scan(void)
 {
+    if(!wifi_ok){
+        wifi_ok=wifi_manager_init()==ESP_OK;
+        if(!wifi_ok){
+            show_message(false,"WIFI NOT READY","INITIALIZATION FAILED",
+                         "RETRY FROM SETTINGS","OFFLINE TOOLS STILL AVAILABLE");return;
+        }
+    }
     header("SCANNING WIFI","SEARCHING FOR 2.4 GHZ NETWORKS");
     display_text(16,68,"PLEASE WAIT...",UI_CYAN,1);
     display_present();
@@ -961,6 +1015,7 @@ static void adjust_setting(int direction)
             if(sound_enabled())sound_notify(true);
             break;
         case 3:{
+            if(!wifi_ok)wifi_ok=wifi_manager_init()==ESP_OK;
             int mode=((int)wifi_manager_mode()+(direction<0?3:1))%4;
             if(wifi_manager_set_mode((m5_wifi_mode_t)mode)!=ESP_OK)
                 show_message(false,"WIFI MODE FAILED","CHECK ESP-IDF LOG","SETTINGS RETAINED","");
@@ -994,7 +1049,7 @@ static void activate_setting(void)
                      sd_ok?"NO FORMAT PERFORMED":"CHECK SERIAL LOG / RETRY");
         return;
     }
-    if(settings_selected==8){page=PAGE_DIAGNOSTICS;return;}
+    if(settings_selected==8){diagnostics_system_page=false;page=PAGE_DIAGNOSTICS;return;}
     adjust_setting(1);
 }
 static void handle_wifi_password(cp_key_event_t e)
@@ -1016,8 +1071,49 @@ static void handle_wifi_password(cp_key_event_t e)
     wifi_password_error=false;
 }
 
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    switch(reason){
+        case ESP_RST_POWERON:return "POWER ON";
+        case ESP_RST_EXT:return "EXTERNAL RESET";
+        case ESP_RST_SW:return "SOFTWARE RESET";
+        case ESP_RST_PANIC:return "PANIC";
+        case ESP_RST_INT_WDT:return "INT WATCHDOG";
+        case ESP_RST_TASK_WDT:return "TASK WATCHDOG";
+        case ESP_RST_WDT:return "OTHER WATCHDOG";
+        case ESP_RST_DEEPSLEEP:return "DEEP SLEEP";
+        case ESP_RST_BROWNOUT:return "BROWNOUT";
+        case ESP_RST_SDIO:return "SDIO RESET";
+        default:return "UNKNOWN";
+    }
+}
+static void render_system_diagnostics(void)
+{
+    header("SYSTEM STATUS","V" M5_PROM_BUILD_ID " / RELEASE CHECK");
+    display_text(12,46,"LAST RESET",UI_MUTED,1);
+    fit_text(91,46,reset_reason_name(last_reset_reason),23,UI_CYAN,1);
+    char value[28];
+    display_text(12,59,"UI STACK",UI_MUTED,1);
+    snprintf(value,sizeof(value),"%u BYTES",M5_PROM_UI_STACK_BYTES);
+    display_text(91,59,value,UI_WHITE,1);
+    const unsigned long free_stack=(unsigned long)uxTaskGetStackHighWaterMark(NULL);
+    display_text(12,72,"STACK MIN",UI_MUTED,1);
+    snprintf(value,sizeof(value),"%lu BYTES FREE",free_stack);
+    fit_text(91,72,value,23,free_stack<1024?UI_WARN:UI_GOOD,1);
+    display_text(12,85,"HEAP FREE",UI_MUTED,1);
+    snprintf(value,sizeof(value),"%lu BYTES",(unsigned long)esp_get_free_heap_size());
+    fit_text(91,85,value,23,UI_WHITE,1);
+    display_text(12,98,"HEAP MIN",UI_MUTED,1);
+    snprintf(value,sizeof(value),"%lu BYTES",(unsigned long)esp_get_minimum_free_heap_size());
+    fit_text(91,98,value,23,UI_WHITE,1);
+    display_text(12,110,"WIFI RADIO",UI_MUTED,1);
+    display_text(91,110,!wifi_manager_radio_state_known()?"UNKNOWN":
+                 wifi_manager_radio_running()?"RUNNING":"STOPPED",UI_CYAN,1);
+    footer("TAB STORAGE  ENTER REFRESH  BACK");
+}
 static void render_diagnostics(void)
 {
+    if(diagnostics_system_page){render_system_diagnostics();return;}
     header("DIAGNOSTICS","FAT FILESYSTEM / EEPROM 0X54");
     display_text(12,46,"SD MOUNT",UI_MUTED,1);
     display_text(92,46,storage_mounted()?"YES":"NO",storage_mounted()?UI_GOOD:UI_BAD,1);
@@ -1039,7 +1135,7 @@ static void render_diagnostics(void)
     }else{
         fit_text(12,110,storage_last_hint()[0]?storage_last_hint():"USB REMOTE READY",35,UI_WARN,1);
     }
-    footer("ENTER RETEST   BACK SETTINGS");
+    footer("ENTER RETEST  TAB SYSTEM  BACK");
 }
 static void run_diagnostics(void)
 {
@@ -1095,14 +1191,25 @@ static void render_confirm_write(void)
     display_rect(7,46,226,67,UI_PANEL);
     display_rect(7,46,3,67,write_armed?UI_WARN:UI_ACCENT);
     display_text(15,49,"TARGET",UI_MUTED,1);
-    fit_text(59,49,write_target_folder,20,UI_WHITE,1);
+    /* The PREWRITE folder is only a filesystem path; do not display it as
+     * though it were the target's actual EEPROM serial. */
+    char target_serial[13];image_extract_serial(prewrite_target,target_serial);
+    fit_text(59,49,target_serial,20,
+             image_serial_valid(prewrite_target)?UI_WHITE:UI_WARN,1);
     display_text(15,63,"SOURCE",UI_MUTED,1);
-    fit_text(59,63,session.folder,20,UI_CYAN,1);
+    /* Show the actual serial bytes, not the possibly stale SD folder name.
+     * A malformed serial is marked by colour and included in warnings below. */
+    char source_serial[13];image_extract_serial(session.working,source_serial);
+    fit_text(59,63,source_serial,20,
+             (write_warning_flags&IMAGE_WRITE_WARN_SERIAL)?UI_WARN:UI_CYAN,1);
     char size_line[38];
     snprintf(size_line,sizeof(size_line),"%u BYTES / PREWRITE SAVED",(unsigned)write_diffs);
     display_text(15,79,size_line,UI_MUTED,1);
-    display_text(15,94,write_revision_mismatch?"WARNING: REVISION MISMATCH":
-                 write_security_changes?"WARNING: HDD / SECURITY CHANGE":"CHECK TARGET AND IMAGE",UI_WARN,1);
+    display_text(15,90,write_revision_mismatch?"WARNING: REVISION MISMATCH":
+                 write_security_changes?"WARNING: HDD / SECURITY CHANGE":
+                 "VERIFY CHIP / IMAGE BEFORE WRITE",UI_WARN,1);
+    if(write_warning_flags)
+        fit_text(15,102,write_warning_text,35,UI_BAD,1);
     footer(write_armed?"ENTER WRITE NOW / BACK CANCEL":"PRESS Y TO ARM / BACK CANCEL");
 }
 /* HDD Recovery: authenticated Xbox HDD key and an optional drive-specific
@@ -1244,11 +1351,11 @@ static void do_save(void)
     const char *tag=session.is_donor?(session.changed?"DONOR_EDIT":"DONOR"):
                       (session.changed?"EDIT":"SNAPSHOT");
     char folder[sizeof(session.folder)];
-    if(session.is_donor){
-        esp_err_t err=storage_folder_for_raw(session.working,folder,sizeof(folder));
-        if(err!=ESP_OK){show_message(false,"SD FOLDER FAILED",storage_last_error(),
-                                    storage_last_hint(),"WORKING COPY STILL IN RAM");goto done;}
-    }else snprintf(folder,sizeof(folder),"%s",session.folder);
+    /* Always identify the working EEPROM by its current factory S/N,
+     * not the folder from which it was originally loaded. */
+    esp_err_t folder_err=storage_folder_for_raw(session.working,folder,sizeof(folder));
+    if(folder_err!=ESP_OK){show_message(false,"SD FOLDER FAILED",storage_last_error(),
+                                 storage_last_hint(),"WORKING COPY STILL IN RAM");goto done;}
     progress_draw("SAVE TO SD","WRITING / READING BACK",65,0,0,"256 BYTE EEPROM IMAGE");
     char filename[STORAGE_NAME_SIZE];
     esp_err_t err=storage_save_version(folder,tag,session.working,filename,sizeof(filename));
@@ -1405,7 +1512,8 @@ static void begin_text_edit(image_edit_field_t field)
 {
     text_field=field;
     image_edit_value(&session,field,entry_text,sizeof(entry_text));
-    if(!strcmp(entry_text,"UNKNOWN")||!strcmp(entry_text,"DISABLED"))entry_text[0]=0;
+    if(!strcmp(entry_text,"UNKNOWN")||!strcmp(entry_text,"DISABLED")||
+       (field==IMAGE_EDIT_PARENTAL_CODE&&strlen(entry_text)>4))entry_text[0]=0;
     entry_len=strlen(entry_text);
     entry_error=false;
     page=PAGE_TEXT_EDIT;
@@ -1446,13 +1554,14 @@ static bool left(cp_key_event_t e){return e.type==CP_KEY_LEFT||(e.type==CP_KEY_C
 static bool right(cp_key_event_t e){return e.type==CP_KEY_RIGHT||(e.type==CP_KEY_CHAR&&(e.character=='d'||e.character=='D'));}
 static bool back(cp_key_event_t e){return e.type==CP_KEY_BACKSPACE||e.type==CP_KEY_CANCEL;}
 
-static bool working_writable(void)
+/* XbDiag requires both section checksums; picoPromSD additionally requires
+ * valid security HMAC/decryption. A factory-looking serial/MAC is not a write
+ * prerequisite. Preserve all raw bytes and show other anomalies as warnings. */
+static const char *working_write_block_reason(void)
 {
-    if(!session.loaded)return false;
-    image_report_t r;image_report(&session,&r);
-    return r.factory_ok&&r.user_ok&&r.security_ok&&r.security_iv>=1&&
-           r.serial_ok&&r.mac_ok&&r.video_ok&&r.video_flags_ok&&
-           r.language_ok&&r.dvd_ok&&r.audio_ok&&r.ratings_ok&&r.parental_ok;
+    if(!session.loaded)return "NO EEPROM IMAGE LOADED";
+    image_report_t report;image_report(&session,&report);
+    return image_write_block_reason(&report);
 }
 // Donor creation and donor cloning have different persistence rules:
 //   Scratch:  generate -> verify -> automatically save to microSD.
@@ -1523,19 +1632,30 @@ static void do_copy_donor(const uint8_t raw[256])
 static void do_generate_donor(void)
 {
     uint8_t entropy[DONOR_RANDOM_SIZE],raw[256];
-    if(battery_ok){
+    /* The running RF driver already supplies hardware RNG entropy, including
+     * while STA is disconnected. Never enable SAR entropy alongside Wi-Fi.
+     * With RF stopped, release any battery ADC handle before using SAR. */
+    if(!wifi_manager_radio_state_known()){
+        show_message(false,"ENTROPY NOT READY","WIFI RADIO STATE UNKNOWN",
+                     "SET WIFI OFF AND RETRY","NO IMAGE WAS REPLACED");
+        return;
+    }
+    const bool rf_entropy=wifi_manager_radio_running();
+    const bool restore_battery=battery_ok;
+    if(!rf_entropy){
         esp_err_t pause_err=battery_suspend();
         if(pause_err!=ESP_OK){
-            battery_ok=false;
             show_message(false,"ENTROPY NOT READY","BATTERY ADC RELEASE FAILED",
                          esp_err_to_name(pause_err),"NO IMAGE WAS REPLACED");
             return;
         }
+        bootloader_random_enable();
     }
-    bootloader_random_enable();
     esp_fill_random(entropy,sizeof(entropy));
-    bootloader_random_disable();
-    if(battery_ok)battery_ok=(battery_init()==ESP_OK);
+    if(!rf_entropy){
+        bootloader_random_disable();
+        if(restore_battery)battery_ok=(battery_init()==ESP_OK);
+    }
     bool ok=donor_generate(raw,donor_selected+1,entropy);
     memset(entropy,0,sizeof(entropy));
     if(!ok){show_message(false,"DONOR CRYPTO FAILED","ENCRYPTION / CHECKSUM TEST",
@@ -1543,18 +1663,35 @@ static void do_generate_donor(void)
     adopt_donor(raw,false);
     memset(raw,0,sizeof(raw));
 }
+/* Compact enough for the 240x135 confirmation display. Report every
+ * independent anomaly rather than hiding SERIAL behind an HMAC warning. */
+static void prepare_write_warning_text(unsigned flags)
+{
+    write_warning_text[0]=0;
+    if(!flags)return;
+    snprintf(write_warning_text,sizeof(write_warning_text),"WARN: %s%s%s%s%s%s",
+             (flags&IMAGE_WRITE_WARN_HMAC)?"HMAC ":"",
+             (flags&IMAGE_WRITE_WARN_DEBUG)?"DEBUG ":"",
+             (flags&IMAGE_WRITE_WARN_SERIAL)?"SERIAL ":"",
+             (flags&IMAGE_WRITE_WARN_MAC)?"MAC ":"",
+             (flags&IMAGE_WRITE_WARN_ONLINE_KEY)?"ONLINE ":"",
+             (flags&IMAGE_WRITE_WARN_SETTINGS)?"SET":"");
+}
 static void do_prepare_write(void)
 {
     prewrite_valid=false;write_armed=false;
+    write_warning_flags=0;write_warning_text[0]=0;
     if(!requires_image()||!acquire_operation_or_warn())return;
     if(!sd_ok)sd_ok=storage_init()==ESP_OK;
     if(!sd_ok){show_message(false,"WRITE CANCELED - NO SD",storage_last_error(),
                             storage_last_hint(),"PREWRITE BACKUP REQUIRED");goto release;}
     if(!i2c_ok){show_message(false,"WRITE NOT READY","I2C REQUIRED",
                              "CHECK TARGET POWER / GROVE","");goto release;}
-    if(!working_writable()){
-        show_message(false,"IMAGE VALIDATION FAILED","REPAIR / INSPECT IMAGE",
-                     "REQUIRES VALID RETAIL HMAC","");goto release;
+    const char *block_reason=working_write_block_reason();
+    if(block_reason){
+        ESP_LOGW(TAG,"EEPROM write blocked: %s",block_reason);
+        show_message(false,"IMAGE WRITE BLOCKED",block_reason,
+                     "INSPECT / REPAIR WORKING IMAGE","NO CHIP WRITE PERFORMED");goto release;
     }
     progress_reset();
     progress_draw("PREPARE WRITE","VERIFYING PHYSICAL TARGET",2,0,0,"NO EEPROM WRITE YET");
@@ -1581,8 +1718,10 @@ static void do_prepare_write(void)
     // remount of either file while waiting for the final Y, then ENTER consent.
     progress_draw("PREPARE WRITE","SAVING PROPOSED IMAGE",76,0,0,"TO_WRITE BACKUP");
     char source_name[STORAGE_NAME_SIZE];
-    err=storage_save_version(session.folder,"TO_WRITE",session.working,
-                             source_name,sizeof(source_name));
+    char source_folder[STORAGE_NAME_SIZE];
+    err=storage_folder_for_raw(session.working,source_folder,sizeof(source_folder));
+    if(err==ESP_OK)err=storage_save_version(source_folder,"TO_WRITE",session.working,
+                                            source_name,sizeof(source_name));
     if(err!=ESP_OK){
         sd_ok=storage_ready();
         show_message(false,"IMAGE SAVE FAILED",storage_last_error(),
@@ -1599,6 +1738,8 @@ static void do_prepare_write(void)
     image_report(&target_session,&target_report);
     image_report_t desired_report;
     image_report(&session,&desired_report);
+    write_warning_flags=image_write_warning_flags(&desired_report);
+    prepare_write_warning_text(write_warning_flags);
     write_revision_mismatch=target_report.security_ok&&
         (target_report.security_iv != desired_report.security_iv);
     memset(&target_session,0,sizeof(target_session));
@@ -1625,13 +1766,13 @@ static void do_commit_write(void)
     progress_reset();
     progress_draw("WRITE EEPROM","RECHECKING PREWRITE STATE",1,0,0,"DO NOT REMOVE POWER");
     progress_job_t job=OP_PROGRESS_COMMIT;
-    eeprom_write_status_t status;
+    eeprom_write_status_t status={0};
     esp_err_t err=eeprom_write_verified_progress(session.working,prewrite_target,
                                                   &status,on_eeprom_progress,&job);
     memset(prewrite_target,0,sizeof(prewrite_target));
     write_guard_held=false;
     operation_guard_release();
-    if(err==ESP_ERR_INVALID_STATE){
+    if(status.target_changed){
         show_message(false,"TARGET CONTENT CHANGED","WRITE CANCELED / NO CHANGES",
                      "NEW READ / BACKUP REQUIRED","");return;
     }
@@ -2137,14 +2278,27 @@ static void handle_key(cp_key_event_t e)
             if(up(e)){repair_selected--;clamp_selection(&repair_selected,IMAGE_FIX_COUNT);}
             else if(down(e)){repair_selected++;clamp_selection(&repair_selected,IMAGE_FIX_COUNT);}
             else if(back(e))page=PAGE_MENU;
-            else if(e.type==CP_KEY_ENTER){pending_fix=(image_fix_field_t)repair_selected;page=PAGE_CONFIRM_FIX;}
+            else if(e.type==CP_KEY_ENTER){
+                image_report_t report;image_report(&session,&report);
+                pending_fix=(image_fix_field_t)repair_selected;
+                if(pending_fix==IMAGE_FIX_GAME_REGION&&!report.security_ok)
+                    show_message(false,"GAME REGION LOCKED","SECURITY HASH INVALID",
+                                 "LOAD A VALID EEPROM BACKUP","NO BYTES WERE CHANGED");
+                else if(image_fix_problem(&report,pending_fix))page=PAGE_CONFIRM_FIX;
+            }
             break;
         case PAGE_CONFIRM_FIX:
             if(back(e))page=PAGE_REPAIR;
             else if(e.type==CP_KEY_ENTER){
                 bool modified=image_apply_fix(&session,pending_fix);
-                if(modified)sound_notify(true);
-                page=PAGE_REPAIR;
+                image_report_t report;image_report(&session,&report);
+                if(image_fix_problem(&report,pending_fix))
+                    show_message(false,"REPAIR NOT APPLIED",image_fix_label(pending_fix),
+                                 "CHECK IMAGE / LOAD BACKUP","NO CHIP WRITE WAS MADE");
+                else{
+                    if(modified)sound_notify(true);
+                    page=PAGE_REPAIR;
+                }
             }
             break;
         case PAGE_CONFIRM_DISCARD:
@@ -2249,7 +2403,9 @@ static void handle_key(cp_key_event_t e)
             break;
         case PAGE_DIAGNOSTICS:
             if(back(e))page=PAGE_SETTINGS;
-            else if(e.type==CP_KEY_ENTER)run_diagnostics();
+            else if(e.type==CP_KEY_CHAR&&e.character=='\t')
+                diagnostics_system_page=!diagnostics_system_page;
+            else if(e.type==CP_KEY_ENTER&&!diagnostics_system_page)run_diagnostics();
             break;
         case PAGE_FM_FOLDERS:
         case PAGE_FM_FILES:
@@ -2332,9 +2488,15 @@ static void handle_key(cp_key_event_t e)
      * The buffers are unnecessary until the user opens F again. */
     if(fm_mem && !fm_is_page(page))fm_release();
 }
-void app_main(void)
+static void m5_prom_task(void *context)
 {
-    ESP_LOGI(TAG,"M5 Prom v0.9.4 - Xbox EEPROM Suite");
+    (void)context;
+    /* Let app_main return and release its startup stack before allocating
+     * the framebuffer, Wi-Fi and USB Remote buffers on this no-PSRAM board. */
+    vTaskDelay(1);
+    ESP_LOGI(TAG,"M5 Prom v" M5_PROM_BUILD_ID " - Xbox EEPROM Suite");
+    ESP_LOGI(TAG,"Last reset: %s; application stack: %u bytes",
+             reset_reason_name(last_reset_reason),M5_PROM_UI_STACK_BYTES);
     ESP_ERROR_CHECK(display_init());
     /* Flash-resident art is displayed before mounting SD or starting Wi-Fi.
      * The bar tracks completed work, not an estimated time-to-boot.
@@ -2426,7 +2588,9 @@ void app_main(void)
         }
         if((uint32_t)(now_ms-last_net_ms)>=1000u){
             last_net_ms=now_ms;
-            if(wifi_ok)wifi_manager_tick(now_ms);
+            /* The manager guards incomplete driver initialization itself.
+             * Pending mode changes must recover even when boot apply failed. */
+            wifi_manager_tick(now_ms);
             web_files_tick(settings_web_enabled(),wifi_manager_network_up());
             if(page==PAGE_SETTINGS||page==PAGE_WIFI_STATUS)redraw=true;
         }
@@ -2440,5 +2604,16 @@ void app_main(void)
         if(ev.type!=CP_KEY_NONE && pc_connected)
             remote_usb_key_rendered(remote_key_sequence);
         vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void app_main(void)
+{
+    last_reset_reason=esp_reset_reason();
+    if(xTaskCreate(m5_prom_task,"m5_prom",M5_PROM_UI_STACK_BYTES,NULL,
+                   tskIDLE_PRIORITY+1,NULL)!=pdPASS){
+        /* Do not fall back to running the same deep call chains on the
+         * undersized startup stack, or turn allocation failure into a reset. */
+        ESP_LOGE(TAG,"Unable to allocate M5 Prom application task");
     }
 }

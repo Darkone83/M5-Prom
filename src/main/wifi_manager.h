@@ -34,7 +34,17 @@ esp_err_t wifi_manager_set_mode(m5_wifi_mode_t mode);
 m5_wifi_mode_t wifi_manager_mode(void);
 esp_err_t wifi_manager_join(const char *ssid,const char *password);
 size_t wifi_manager_scan(m5_wifi_scan_entry_t *out,size_t max_entries);
+/* Call tick even after init reports a mode-apply failure: initialized driver
+ * transitions retry every five seconds. Failed driver initialization itself
+ * requires another explicit wifi_manager_init() call. */
 void wifi_manager_tick(uint32_t now_ms);
 m5_wifi_status_t wifi_manager_status(void);
 bool wifi_manager_network_up(void);
+/* Tracks RF use independently of configured mode or link state, including
+ * offline scans. After an uncertain start/stop failure, running remains
+ * conservative and is NOT evidence of a live entropy source. Check known
+ * before choosing either RF or SAR entropy. Only the foreground UI task
+ * changes modes or queries these flags. */
+bool wifi_manager_radio_running(void);
+bool wifi_manager_radio_state_known(void);
 const char *wifi_manager_mode_name(m5_wifi_mode_t mode);

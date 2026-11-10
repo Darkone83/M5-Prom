@@ -23,7 +23,8 @@ int storage_last_errno(void);
 // Non-destructive temporary file write / sync / readback / delete check.
 // Existing files and folders are never overwritten, deleted or formatted.
 esp_err_t storage_self_test(void);
-// Creates /EEPROMs/SN, or /EEPROMs/UNKNOWN_<CRC32> for invalid serial numbers.
+// Creates /EEPROMs/<12-digit SN>, RAW_<ASCII> for atypical printable SN,
+// or RAW_<24 hex digits> when those bytes are binary/unsafe; no identity guessed.
 esp_err_t storage_folder_for_raw(const uint8_t raw[256],char *folder,size_t len);
 // Creates a new file exclusively (never overwrite), reopens and byte-verifies it.
 esp_err_t storage_save_version(const char *folder,const char *tag,const uint8_t raw[256],char *name,size_t name_len);

@@ -29,6 +29,7 @@ typedef struct {
     uint16_t different;      // Bytes requiring a write.
     uint16_t acknowledged;   // Writes with a successful post-write ACK.
     bool verified;           // Final two reads matched requested image.
+    bool target_changed;     // Fresh reads differ from the PREWRITE snapshot.
 } eeprom_write_status_t;
 
 esp_err_t eeprom_init(void);

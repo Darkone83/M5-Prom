@@ -32,6 +32,7 @@
 
 static const char *TAG="sd_images";
 static bool mounted=false, ready=false;
+static bool spi_initialized=false;
 static sdmmc_card_t *sdcard=NULL;
 static char last_error[48]="SD NOT INITIALIZED";
 static char last_stage[32]="NOT INITIALIZED";
@@ -139,7 +140,7 @@ static esp_err_t probe_writable(void)
             uint8_t check[sizeof(token)]={0};
             size_t got=fread(check,1,sizeof(check),f);
             int extra=fgetc(f);
-            if(got!=sizeof(token)||extra!=EOF||memcmp(token,check,sizeof(token))!=0){
+            if(got!=sizeof(token)||extra!=EOF||ferror(f)||memcmp(token,check,sizeof(token))!=0){
                 ok=false;saved_errno=EIO;
             }
             if(fclose(f)!=0){ok=false;saved_errno=errno;}
@@ -165,8 +166,12 @@ esp_err_t storage_init(void)
             .mosi_io_num=CP_SD_MOSI,.miso_io_num=CP_SD_MISO,.sclk_io_num=CP_SD_SCLK,
             .quadwp_io_num=-1,.quadhd_io_num=-1,.max_transfer_sz=4096
         };
-        esp_err_t err=spi_bus_initialize(SPI3_HOST,&bus,SPI_DMA_CH_AUTO);
-        if(err!=ESP_OK)return report_esp("SD SPI INIT",err);
+        esp_err_t err=ESP_OK;
+        if(!spi_initialized){
+            err=spi_bus_initialize(SPI3_HOST,&bus,SPI_DMA_CH_AUTO);
+            if(err!=ESP_OK)return report_esp("SD SPI INIT",err);
+            spi_initialized=true;
+        }
         sdmmc_host_t host=SDSPI_HOST_DEFAULT();
         host.slot=SPI3_HOST;
         host.max_freq_khz=10000; // reliable margin for removable microSD
@@ -178,7 +183,9 @@ esp_err_t storage_init(void)
         };
         err=esp_vfs_fat_sdspi_mount(M5_PROM_SD_MOUNT_POINT,&host,&slot,&mount,&sdcard);
         if(err!=ESP_OK){
-            (void)spi_bus_free(SPI3_HOST);
+            esp_err_t freed=spi_bus_free(SPI3_HOST);
+            if(freed==ESP_OK)spi_initialized=false;
+            else ESP_LOGW(TAG,"SD SPI cleanup failed: %s",esp_err_to_name(freed));
             sdcard=NULL;
             return report_esp("SD FAT MOUNT",err);
         }
@@ -224,8 +231,11 @@ esp_err_t storage_remount(void)
         esp_err_t err=esp_vfs_fat_sdcard_unmount(M5_PROM_SD_MOUNT_POINT,sdcard);
         if(err!=ESP_OK)return report_esp("SD UNMOUNT",err);
         mounted=false;sdcard=NULL;
-        err=spi_bus_free(SPI3_HOST);
+    }
+    if(spi_initialized){
+        esp_err_t err=spi_bus_free(SPI3_HOST);
         if(err!=ESP_OK)return report_esp("SD SPI FREE",err);
+        spi_initialized=false;
     }
     return storage_init();
 }
@@ -258,14 +268,6 @@ static esp_err_t ensure_folder(const char *folder)
     }
     return ESP_OK;
 }
-static uint32_t crc32(const uint8_t data[256])
-{
-    uint32_t c=0xffffffffu;
-    for(int i=0;i<256;i++){
-        c^=data[i];for(int j=0;j<8;j++)c=(c>>1)^((c&1)?0xedb88320u:0);
-    }
-    return ~c;
-}
 esp_err_t storage_folder_for_raw(const uint8_t raw[256],char *folder,size_t len)
 {
     if(!ready||!raw||!folder)return ESP_ERR_INVALID_STATE;
@@ -273,8 +275,35 @@ esp_err_t storage_folder_for_raw(const uint8_t raw[256],char *folder,size_t len)
         if(len<13)return ESP_ERR_INVALID_SIZE;
         memcpy(folder,raw+0x34,12);folder[12]=0;
     }else{
-        if(len<17)return ESP_ERR_INVALID_SIZE;
-        snprintf(folder,len,"UNKNOWN_%08lX",(unsigned long)crc32(raw));
+        /* Never replace the actual serial bytes with a guessed value.
+         * Safe atypical ASCII stays readable. All other 12-byte fields are
+         * encoded losslessly as 24 hexadecimal characters so a technician
+         * can inspect the raw S/N from the folder name (XbDiag decodes these
+         * same 12 bytes without any decryption). New files still use exclusive
+         * versioned names and never overwrite another dump. */
+        bool safe=true;
+        for(int i=0;i<12;i++){
+            const unsigned char ch=raw[0x34+i];
+            if(!(ch>='0'&&ch<='9') && !(ch>='A'&&ch<='Z') &&
+               !(ch>='a'&&ch<='z') && ch!='_' && ch!='-'){
+                safe=false;break;
+            }
+        }
+        if(safe){
+            if(len<17)return ESP_ERR_INVALID_SIZE;
+            memcpy(folder,"RAW_",4);
+            memcpy(folder+4,raw+0x34,12);
+            folder[16]=0;
+        }else{
+            if(len<29)return ESP_ERR_INVALID_SIZE;
+            static const char hx[]="0123456789ABCDEF";
+            memcpy(folder,"RAW_",4);
+            for(int i=0;i<12;i++){
+                folder[4+i*2]=hx[raw[0x34+i]>>4];
+                folder[5+i*2]=hx[raw[0x34+i]&15];
+            }
+            folder[28]=0;
+        }
     }
     return ensure_folder(folder);
 }
@@ -287,13 +316,15 @@ static bool verify_saved(const char *path,const uint8_t raw[256])
 {
     FILE *f=fopen(path,"rb");if(!f)return false;
     uint8_t check[256];size_t n=fread(check,1,256,f);
-    int extra=fgetc(f);int closed=fclose(f);
-    return n==256&&extra==EOF&&closed==0&&memcmp(raw,check,256)==0;
+    int extra=fgetc(f);bool failed=ferror(f)!=0;int closed=fclose(f);
+    return n==256&&extra==EOF&&!failed&&closed==0&&memcmp(raw,check,256)==0;
 }
 esp_err_t storage_save_version(const char *folder,const char *tag,const uint8_t raw[256],char *name,size_t name_len)
 {
+    if(name&&name_len)name[0]=0;
     if(!ready||!folder||!tag||!raw||!name||name_len<20)return ESP_ERR_INVALID_STATE;
     if(!valid_part(tag)||strlen(tag)>STORAGE_NAME_SIZE-10)return ESP_ERR_INVALID_ARG;
+    if(name_len<strlen(tag)+10)return ESP_ERR_INVALID_SIZE;
     esp_err_t e=ensure_folder(folder);
     if(e!=ESP_OK)return e;
     for(unsigned id=1;id<=9999;id++){
@@ -342,8 +373,12 @@ esp_err_t storage_load_version(const char *folder,const char *name,uint8_t raw[2
         return ESP_ERR_INVALID_ARG;
     char path[160];snprintf(path,sizeof(path),"%s/%s/%s",ROOT,folder,name);
     FILE *f=fopen(path,"rb");if(!f)return report_error("OPEN EEPROM",errno);
-    size_t n=fread(raw,1,256,f);int extra=fgetc(f);int closed=fclose(f);
-    if(n!=256||extra!=EOF||closed!=0){
+    size_t n=fread(raw,1,256,f);int extra=fgetc(f);
+    bool failed=ferror(f)!=0;
+    int read_errno=failed?errno:0;
+    if(fclose(f)!=0){failed=true;read_errno=errno;}
+    if(failed)return report_error("READ EEPROM",read_errno?read_errno:EIO);
+    if(n!=256||extra!=EOF){
         snprintf(last_error,sizeof(last_error),"EEPROM FILE NOT 256 BYTES");
         snprintf(last_hint,sizeof(last_hint),"SELECT A VALID EEPROM BIN");
         return ESP_ERR_INVALID_SIZE;
@@ -432,6 +467,7 @@ esp_err_t storage_save_hdd_report(const char *folder,const char *report,size_t r
             checked+=chunk;
         }
         if(success&&fgetc(f)!=EOF)success=false;
+        if(ferror(f))success=false;
         if(fclose(f)!=0)success=false;
         memset(buf,0,sizeof(buf));
         if(!success){
@@ -680,6 +716,7 @@ esp_err_t storage_manager_text_page(const char *folder,const char *name,size_t f
     }
     if(ferror(file))failed=true;
     if(!failed && bytes==65536 && (ch=fgetc(file))!=EOF) *truncated=true;
+    if(ferror(file))failed=true;
     if(fclose(file)!=0)failed=true;
     if(failed)return report_error("FM TXT READ",EIO);
     if(col || (!count&&!previous_newline)){

@@ -24,12 +24,17 @@ typedef enum {
 
 typedef enum {
     IMAGE_FIX_FACTORY=0, IMAGE_FIX_USER, IMAGE_FIX_VIDEO,
-    IMAGE_FIX_LANGUAGE, IMAGE_FIX_DVD, IMAGE_FIX_AUDIO, IMAGE_FIX_COUNT
+    IMAGE_FIX_LANGUAGE, IMAGE_FIX_DVD, IMAGE_FIX_AUDIO,
+    IMAGE_FIX_VIDEO_FLAGS, IMAGE_FIX_GAME_REGION, IMAGE_FIX_TIMEZONE,
+    IMAGE_FIX_GAME_RATING, IMAGE_FIX_MOVIE_RATING, IMAGE_FIX_PARENTAL_CODE,
+    IMAGE_FIX_COUNT
 } image_fix_field_t;
 
 typedef struct {
     bool factory_ok, user_ok, security_ok, serial_ok, mac_ok;
     bool video_ok, video_flags_ok, language_ok, dvd_ok, audio_ok;
+    bool game_region_ok, timezone_ok, online_key_ok;
+    bool game_rating_ok, movie_rating_ok;
     bool ratings_ok, parental_ok;
     int security_iv; // 0..3, -1 when authentication fails.
 } image_report_t;
@@ -48,6 +53,20 @@ typedef struct {
 void image_begin(image_session_t *session,const uint8_t raw[256],bool from_chip);
 void image_report(const image_session_t *session,image_report_t *result);
 void image_extract_serial(const uint8_t raw[256],char serial[13]);
+/* Cross-reference gate: XbDiag factory/user checksums + picoPromSD
+ * successful security HMAC/RC4 authentication. Serial, Ethernet MAC and
+ * optional settings are warnings, never standalone write blockers.
+ * The SD loader enforces the exact 256-byte image length. */
+const char *image_write_block_reason(const image_report_t *report);
+enum {
+    IMAGE_WRITE_WARN_HMAC = 1u << 0,
+    IMAGE_WRITE_WARN_DEBUG = 1u << 1,
+    IMAGE_WRITE_WARN_SERIAL = 1u << 2,
+    IMAGE_WRITE_WARN_MAC = 1u << 3,
+    IMAGE_WRITE_WARN_SETTINGS = 1u << 4,
+    IMAGE_WRITE_WARN_ONLINE_KEY = 1u << 5
+};
+unsigned image_write_warning_flags(const image_report_t *report);
 bool image_serial_valid(const uint8_t raw[256]);
 uint32_t image_read_u32(const uint8_t raw[256],int off);
 
@@ -64,6 +83,8 @@ const char *image_edit_text_hint(image_edit_field_t field);
 
 const char *image_fix_label(image_fix_field_t field);
 bool image_fix_problem(const image_report_t *report,image_fix_field_t field);
+/* Repairs only a diagnosed problem. Healthy fields and unauthenticated
+ * security edits return false without changing the session. */
 bool image_apply_fix(image_session_t *session,image_fix_field_t field);
 void image_revert(image_session_t *session);
 void image_refresh_checksums(uint8_t raw[EEPROM_IMAGE_SIZE]);

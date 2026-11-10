@@ -42,10 +42,22 @@ esp_err_t eeprom_probe(void)
 
 static esp_err_t read_once(uint8_t out[256])
 {
-    // Read the entire 24C02 in one sequential-read transaction.
-    // This uses a memory-address byte but never transmits EEPROM content.
-    uint8_t offset = 0;
-    return i2c_master_transmit_receive(s_dev, &offset, 1, out, XBOX_EEPROM_SIZE, 300);
+    /* Explicitly address every byte, as XbDiag's physical EEPROM reader does.
+     * Each random-read transaction sets the memory address then reads one byte;
+     * no EEPROM content is transmitted and no program cycle is started.
+     * Avoid relying on a single 256-byte sequential transfer in circuit. */
+    for (unsigned i = 0; i < XBOX_EEPROM_SIZE; ++i) {
+        const uint8_t offset = (uint8_t)i;
+        esp_err_t err = i2c_master_transmit_receive(s_dev, &offset, 1, out+i, 1, 300);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Read failed at EEPROM offset 0x%02X", (unsigned)offset);
+            return err;
+        }
+        /* A positive tick lets the USB/Wi-Fi and idle tasks run even with a
+         * 100 Hz FreeRTOS tick. Do not use a sub-tick millisecond delay here. */
+        if ((i & 31u) == 31u) vTaskDelay(1);
+    }
+    return ESP_OK;
 }
 
 static void send_progress(eeprom_progress_cb_t cb,void *user,
@@ -109,6 +121,7 @@ esp_err_t eeprom_write_verified_progress(const uint8_t desired[256],
     esp_err_t err=read_verified_impl(current,cb,user,false);
     if(err!=ESP_OK)return err;
     if(memcmp(current,expected_before,256)!=0){
+        status->target_changed=true;
         ESP_LOGE(TAG,"EEPROM changed since PREWRITE snapshot; refusing write");
         return ESP_ERR_INVALID_STATE;
     }
